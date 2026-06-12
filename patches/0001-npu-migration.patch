@@ -1,0 +1,811 @@
+diff --git a/examples/wordle/rl_npu.toml b/examples/wordle/rl_npu.toml
+new file mode 100644
+index 000000000..f2c14810c
+--- /dev/null
++++ b/examples/wordle/rl_npu.toml
+@@ -0,0 +1,60 @@
++# Wordle RL on Ascend NPU (2-card minimal setup)
++# Usage: uv run rl @ examples/wordle/rl_npu.toml
++#
++# Override model path if needed:
++#   uv run rl @ examples/wordle/rl_npu.toml --model.name /path/to/model
++#
++# Override NPU devices:
++#   ASCEND_RT_VISIBLE_DEVICES=14,15 uv run rl @ examples/wordle/rl_npu.toml
++
++max_steps = 200
++seq_len = 8192
++
++[deployment]
++type = "single_node"
++gpus_per_node = 2
++num_train_gpus = 1
++num_infer_gpus = 1
++
++[wandb]
++project = "wordle-npu"
++name = "wordle-npu"
++
++[ckpt]
++
++[model]
++name = "/data/z00949579/rl_course/model/Qwen3-1.7B"
++
++# Filesystem weight broadcast avoids NCCL entirely — required for NPU
++[weight_broadcast]
++type = "filesystem"
++
++[orchestrator]
++batch_size = 32
++group_size = 16
++
++[[orchestrator.train.env]]
++id = "primeintellect/wordle"
++name = "wordle"
++
++[orchestrator.train.sampling]
++max_completion_tokens = 1024
++
++# Trainer: NPU-safe settings
++[trainer]
++matmul_precision = "highest"  # Required on non-CUDA devices (like ROCm)
++
++[trainer.model]
++attn = "eager"                # No flash-attn on NPU
++optimization_dtype = "float32"
++reduce_dtype = "float32"
++impl = "hf"                   # Use HuggingFace implementation
++
++# Inference: single NPU, no data parallelism
++[inference.parallel]
++dp = 1
++tp = 1
++
++[orchestrator.renderer]
++name = "qwen3"
++preserve_all_thinking = true
+diff --git a/src/prime_rl/_device.py b/src/prime_rl/_device.py
+new file mode 100644
+index 000000000..aed7cd7d2
+--- /dev/null
++++ b/src/prime_rl/_device.py
+@@ -0,0 +1,160 @@
++"""Device abstraction layer for NPU (Ascend) / CUDA portability.
++
++Import this module instead of hardcoding ``"cuda"`` or ``torch.cuda.*`` calls.
++On Ascend NPUs the module redirects to ``torch.npu`` and ``hccl``; on CUDA GPUs
++it stays on the original path.
++
++Usage::
++
++    from prime_rl._device import device_type, device_module, get_device, get_device_string
++
++    # String for torch.device() and .to(...) calls:
++    x = tensor.to(get_device_string())
++
++    # torch.device object:
++    dev = get_device(local_rank)
++
++    # For torch.X.set_device:
++    device_module.set_device(local_rank)
++
++    # Backend string for dist.init_process_group:
++    backend = get_dist_backend(enable_gloo=False)
++"""
++
++from __future__ import annotations
++
++import torch
++
++# -- Detection -----------------------------------------------------------
++_HAS_NPU = hasattr(torch, "npu") and torch.npu.is_available()
++_HAS_CUDA = torch.cuda.is_available()
++
++if _HAS_NPU:
++    device_type: str = "npu"
++    device_module = torch.npu
++    _DIST_BACKEND = "hccl"
++elif _HAS_CUDA:
++    device_type = "cuda"
++    device_module = torch.cuda
++    _DIST_BACKEND = "nccl"
++else:
++    # Fallback: assume NPU if torch_npu is imported (even if not detected)
++    device_type = "npu"
++    device_module = getattr(torch, "npu", torch.cuda)
++    _DIST_BACKEND = "hccl" if hasattr(torch, "npu") else "nccl"
++
++
++def get_device_string() -> str:
++    """Return the device type string (``"npu"`` or ``"cuda"``)."""
++    return device_type
++
++
++def get_device(local_rank: int = -1) -> torch.device:
++    """Return a ``torch.device`` for the detected accelerator.
++
++    When ``local_rank >= 0``, the index targets a specific device (e.g. for
++    ``torch.device("npu", 0)``).  When ``-1``, returns the generic device
++    (``torch.device("npu")``).
++    """
++    if local_rank >= 0:
++        return torch.device(device_type, local_rank)
++    return torch.device(device_type)
++
++
++def get_dist_backend(enable_gloo: bool = False) -> str | None:
++    """Return the distributed backend string for ``init_process_group``.
++
++    When ``enable_gloo=True``, returns ``"cpu:gloo,{device}:{comm_backend}"``
++    for CPU offloading scenarios. Otherwise returns ``None`` (the default,
++    which is HCCL on NPU / NCCL on CUDA).
++    """
++    if enable_gloo:
++        return f"cpu:gloo,{device_type}:{_DIST_BACKEND}"
++    return None  # default backend
++
++
++def get_visible_devices_env() -> str:
++    """Environment variable name for visible device selection."""
++    return "ASCEND_RT_VISIBLE_DEVICES" if device_type == "npu" else "CUDA_VISIBLE_DEVICES"
++
++
++def get_alloc_conf_env() -> str:
++    """Environment variable name for PyTorch memory allocator configuration."""
++    return "PYTORCH_NPU_ALLOC_CONF" if device_type == "npu" else "PYTORCH_CUDA_ALLOC_CONF"
++
++
++def get_profiler_activity():
++    """Return the device-appropriate ``ProfilerActivity`` enum value."""
++    if device_type == "npu":
++        # Ascend NPU uses its own profiler activity
++        try:
++            from torch_npu.profiler import ProfilerActivity as NpuProfilerActivity
++            return NpuProfilerActivity.NPU
++        except ImportError:
++            return None  # profiling not supported
++    return torch.profiler.ProfilerActivity.CUDA
++
++
++def get_peak_flops() -> float:
++    """Return peak BF16 FLOPS for the detected device."""
++    if device_type == "npu":
++        name = device_module.get_device_name(0) if device_module.device_count() > 0 else ""
++        if "910" in name:
++            # Ascend 910B/C: ~320 TFLOPS BF16 (matrix)
++            return 320e12
++        return 312e12  # fallback
++    # CUDA path — delegated to PerfCounter._get_peak_flops
++    return 0.0  # caller should use PerfCounter's logic
++
++
++def reset_peak_memory_stats() -> None:
++    """Reset peak memory statistics."""
++    device_module.reset_peak_memory_stats()
++
++
++def max_memory_reserved() -> float:
++    """Return max reserved memory in bytes."""
++    return device_module.max_memory_reserved()
++
++
++def mem_get_info(device_index: int | None = None):
++    """Return (free_bytes, total_bytes) tuple for the device."""
++    return device_module.mem_get_info(device_index)
++
++
++def set_device(device_index: int) -> None:
++    """Set the current device."""
++    device_module.set_device(device_index)
++
++
++def current_device() -> int:
++    """Return the current device index."""
++    return device_module.current_device()
++
++
++def device_count() -> int:
++    """Return the number of available devices."""
++    return device_module.device_count()
++
++
++def synchronize() -> None:
++    """Synchronize the device."""
++    device_module.synchronize()
++
++
++def empty_cache() -> None:
++    """Empty the device memory cache."""
++    device_module.empty_cache()
++
++
++def record_memory_history(max_entries: int = 100000) -> None:
++    """Start recording memory allocation history."""
++    if hasattr(device_module, "memory") and hasattr(device_module.memory, "_record_memory_history"):
++        device_module.memory._record_memory_history(max_entries=max_entries)
++
++
++def memory_snapshot():
++    """Take a memory snapshot. Returns a dict suitable for pickle."""
++    if hasattr(device_module, "memory") and hasattr(device_module.memory, "_snapshot"):
++        return device_module.memory._snapshot()
++    return {}
+diff --git a/src/prime_rl/entrypoints/rl.py b/src/prime_rl/entrypoints/rl.py
+index 0ccdd7c53..400fbe1d5 100644
+--- a/src/prime_rl/entrypoints/rl.py
++++ b/src/prime_rl/entrypoints/rl.py
+@@ -9,9 +9,10 @@ from pathlib import Path
+ from subprocess import Popen
+ from threading import Event, Thread
+ 
+-import pynvml
+ import tomli_w
+ 
++from prime_rl._device import device_count, get_visible_devices_env, get_alloc_conf_env
++
+ from prime_rl.configs.rl import RLConfig
+ from prime_rl.utils.config import cli
+ from prime_rl.utils.logger import get_logger, setup_logger
+@@ -34,11 +35,10 @@ INFERENCE_TOML = "inference.toml"
+ 
+ 
+ def get_physical_gpu_ids() -> list[int]:
+-    """Return physical GPU IDs visible to the launcher."""
+-    raw_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
++    """Return physical device IDs visible to the launcher."""
++    raw_visible = os.environ.get(get_visible_devices_env())
+     if raw_visible is None:
+-        pynvml.nvmlInit()
+-        return list(range(pynvml.nvmlDeviceGetCount()))
++        return list(range(device_count()))
+     return [int(token.strip()) for token in raw_visible.split(",") if token.strip()]
+ 
+ 
+@@ -160,7 +160,7 @@ def rl_local(config: RLConfig):
+                     inference_cmd,
+                     env={
+                         **os.environ,
+-                        "CUDA_VISIBLE_DEVICES": ",".join(map(str, infer_gpu_ids)),
++                        get_visible_devices_env(): ",".join(map(str, infer_gpu_ids)),
+                     },
+                     stdout=log_file,
+                     stderr=log_file,
+@@ -252,9 +252,9 @@ def rl_local(config: RLConfig):
+                     **os.environ,
+                     **wandb_shared_env,
+                     "WANDB_SHARED_LABEL": "trainer",
+-                    "CUDA_VISIBLE_DEVICES": ",".join(map(str, trainer_gpu_ids)),
++                    get_visible_devices_env(): ",".join(map(str, trainer_gpu_ids)),
+                     "PYTHONUNBUFFERED": "1",
+-                    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
++                    get_alloc_conf_env(): "expandable_segments:True",
+                     "LOGURU_FORCE_COLORS": "1",
+                     "WANDB_PROGRAM": "uv run rl",
+                     "WANDB_ARGS": json.dumps(start_command),
+diff --git a/src/prime_rl/trainer/ckpt.py b/src/prime_rl/trainer/ckpt.py
+index d699b5f09..b84f793a0 100644
+--- a/src/prime_rl/trainer/ckpt.py
++++ b/src/prime_rl/trainer/ckpt.py
+@@ -72,12 +72,14 @@ class AppState(Stateful):
+ 
+     def state_dict(self) -> dict[str, Any]:
+         # get_state_dict requires optimizer states to live on param.device. For an
+-        # already-initialized CPU-offload optimizer that means staging back to GPU
++        # already-initialized CPU-offload optimizer that means staging back to device
+         # before the call; the matching offload happens after the dict is built.
++        from prime_rl._device import get_device_string, synchronize
++
+         for opt in self.optimizers:
+             if isinstance(opt, CPUOffloadOptimizer) and opt._initialized:
+-                opt._move_states("cuda")
+-                torch.cuda.synchronize()
++                opt._move_states(get_device_string())
++                synchronize()
+ 
+         # Automatically manages FSDP FQN's, as well as sets the default state dict type to FSDP.SHARDED_STATE_DICT
+         base_optimizers = self._get_base_optimizers()
+@@ -109,7 +111,9 @@ class AppState(Stateful):
+                 opt._move_states("cpu")
+         if has_cpu_offload:
+             gc.collect()
+-            torch.cuda.empty_cache()
++            from prime_rl._device import empty_cache
++
++            empty_cache()
+ 
+         return state_dict
+ 
+@@ -151,9 +155,11 @@ class AppState(Stateful):
+         # it drops the last references to the loaded tensor wrappers so the cuda
+         # allocator can release whatever blocks it cached during the read.
+         if has_cpu_offload:
++            from prime_rl._device import empty_cache
++
+             state_dict.clear()
+             gc.collect()
+-            torch.cuda.empty_cache()
++            empty_cache()
+ 
+ 
+ class CheckpointManager:
+diff --git a/src/prime_rl/trainer/model.py b/src/prime_rl/trainer/model.py
+index 2c349d4de..133c5b255 100644
+--- a/src/prime_rl/trainer/model.py
++++ b/src/prime_rl/trainer/model.py
+@@ -454,16 +454,24 @@ def get_model(
+             )
+ 
+     # GPT-OSS only supports FlashAttention via kernels-community/vllm-flash-attn3, which requires Hopper (SM 90).
+-    # On other architectures (e.g. Blackwell), users must fall back to eager attention.
++    # On other architectures (e.g. Blackwell, Ascend NPU), users must fall back to eager attention.
+     HOPPER_MAJOR = 9
+     if getattr(model_config, "model_type", "") == "gpt_oss":
+         if config.attn != "eager":
+-            major, minor = torch.cuda.get_device_capability()
+-            if major != HOPPER_MAJOR:
++            # NPU / non-NVIDIA: skip compute capability check, assume eager is needed
++            try:
++                major, minor = torch.cuda.get_device_capability()
++                if major != HOPPER_MAJOR:
++                    raise ValueError(
++                        f"GPT-OSS requires 'attn = \"eager\"' on non-Hopper GPUs (detected SM {major}{minor}). "
++                        f"The only flash attention kernel supported by GPT-OSS (kernels-community/vllm-flash-attn3) is Hopper-only. "
++                        f'Set [trainer.model] attn = "eager" in your config.'
++                    )
++            except (RuntimeError, AssertionError):
++                # No CUDA device available — assume non-Hopper
+                 raise ValueError(
+-                    f"GPT-OSS requires 'attn = \"eager\"' on non-Hopper GPUs (detected SM {major}{minor}). "
+-                    f"The only flash attention kernel supported by GPT-OSS (kernels-community/vllm-flash-attn3) is Hopper-only. "
+-                    f'Set [trainer.model] attn = "eager" in your config.'
++                    "GPT-OSS requires 'attn = \"eager\"' on non-Hopper / non-CUDA devices. "
++                    "Set [trainer.model] attn = \"eager\" in your config."
+                 )
+         # Enable hub kernels for GPT-OSS (disabled by default to avoid interfering with other models).
+         import transformers.integrations.hub_kernels as _hub_kernels
+@@ -728,7 +736,9 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
+ 
+ 
+ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
+-    device = "cpu" if config.fsdp_cpu_offload else "cuda"
++    from prime_rl._device import get_device_string
++
++    device = "cpu" if config.fsdp_cpu_offload else get_device_string()
+     model.to_empty(device=device)
+     torch.distributed.barrier()
+ 
+@@ -814,11 +824,12 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
+         if parallel_dims.dp_replicate_enabled:
+             # Synchronize LoRA initialization across dp_replicate ranks by broadcasting a seed
+             dp_replicate_mesh = parallel_dims.world_mesh["dp_replicate"]
+-            seed_tensor = torch.empty(1, dtype=torch.long, device="cuda")
++            dt = get_device_string()
++            seed_tensor = torch.empty(1, dtype=torch.long, device=dt)
+             if dp_replicate_mesh.get_local_rank() == 0:
+                 seed_tensor.random_()
+             torch.distributed.broadcast(seed_tensor, src=0, group=dp_replicate_mesh.get_group())
+-            generator = torch.Generator(device="cuda").manual_seed(seed_tensor.item())
++            generator = torch.Generator(device=dt).manual_seed(seed_tensor.item())
+         for module in lora_modules:
+             module._init_lora_parameters(generator)
+     logger.debug(f"Loaded weights using HF DCP in {time.perf_counter() - load_dcp_start_time:.2f} seconds")
+@@ -975,12 +986,15 @@ def apply_ep(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims)
+ 
+ 
+ def _move_buffers_to_cuda(model: nn.Module, config: ModelConfig) -> None:
+-    """FSDP CPU offloading only manages parameters, not buffers. Move buffers to CUDA."""
++    """FSDP CPU offloading only manages parameters, not buffers. Move buffers to device."""
++    from prime_rl._device import get_device_string
++
+     if not config.fsdp_cpu_offload:
+         return
++    dt = get_device_string()
+     for _, buffer in model.named_buffers():
+         if buffer.device.type == "cpu":
+-            buffer.data = buffer.data.to("cuda")
++            buffer.data = buffer.data.to(dt)
+ 
+ 
+ def _reset_runtime_moe_buffers(model: nn.Module) -> None:
+@@ -1099,11 +1113,13 @@ def setup_model(
+     # 2. if we can load to meta, we either:
+     if possible_to_load_to_meta:
+         # - load from checkpoint later if needed
++        from prime_rl._device import get_device_string as _gds2
++
+         if loading_from_checkpoint_later:
+             logger.warning(
+                 "Skipping loading weights. Initializing an empty model on device, loading from checkpoint later."
+             )
+-            device = "cpu" if config.fsdp_cpu_offload else "cuda"
++            device = "cpu" if config.fsdp_cpu_offload else _gds2()
+             model.to_empty(device=device)
+             torch.distributed.barrier()
+             if isinstance(model, PreTrainedModelPrimeRL):
+diff --git a/src/prime_rl/trainer/optim.py b/src/prime_rl/trainer/optim.py
+index d8465cc38..352fd4060 100644
+--- a/src/prime_rl/trainer/optim.py
++++ b/src/prime_rl/trainer/optim.py
+@@ -64,8 +64,10 @@ class CPUOffloadOptimizer:
+             self._initialized = True
+             return result
+ 
+-        # Move states to GPU
+-        self._move_states("cuda")
++        from prime_rl._device import get_device_string
++
++        # Move states to device
++        self._move_states(get_device_string())
+ 
+         # Run optimizer step
+         result = self.optimizer.step(closure)
+@@ -79,10 +81,12 @@ class CPUOffloadOptimizer:
+         self.optimizer.zero_grad(set_to_none=set_to_none)
+ 
+     def state_dict(self):
+-        # Move to GPU temporarily for consistent state dict
++        # Move to device temporarily for consistent state dict
+         if self._initialized:
+-            self._move_states("cuda")
+-            torch.cuda.synchronize()
++            from prime_rl._device import get_device_string, synchronize
++
++            self._move_states(get_device_string())
++            synchronize()
+         sd = self.optimizer.state_dict()
+         if self._initialized:
+             self._move_states("cpu")
+diff --git a/src/prime_rl/trainer/parallel_dims.py b/src/prime_rl/trainer/parallel_dims.py
+index dbfe85572..8b65cc0df 100644
+--- a/src/prime_rl/trainer/parallel_dims.py
++++ b/src/prime_rl/trainer/parallel_dims.py
+@@ -21,14 +21,12 @@ from dataclasses import dataclass
+ from functools import cached_property
+ 
+ import torch.distributed as dist
+-from torch._utils import _get_available_device_type
+ from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+ 
+ from prime_rl.configs.trainer import ModelConfig
++from prime_rl._device import device_type
+ from prime_rl.utils.logger import get_logger
+ 
+-device_type = _get_available_device_type() or "cuda"
+-
+ __all__ = ["ParallelDims"]
+ 
+ 
+diff --git a/src/prime_rl/trainer/perf.py b/src/prime_rl/trainer/perf.py
+index 595a1d494..5798879ea 100644
+--- a/src/prime_rl/trainer/perf.py
++++ b/src/prime_rl/trainer/perf.py
+@@ -33,7 +33,11 @@ class PerfCounter:
+         self._world = get_world()
+         self._logger = get_logger()
+ 
+-        if torch.cuda.is_available():
++        from prime_rl._device import device_type, device_module, get_device_string
++
++        if device_type == "npu" and device_module.device_count() > 0:
++            self.gpu_peak_flops = self._get_peak_flops(device_module.get_device_name(0))
++        elif torch.cuda.is_available():
+             self.gpu_peak_flops = self._get_peak_flops(torch.cuda.get_device_name(torch.device("cuda")))
+         else:
+             self.gpu_peak_flops = 0
+@@ -101,6 +105,9 @@ class PerfCounter:
+             # https://www.amd.com/en/products/accelerators/instinct/mi300/mi325x.html
+             # Peak BF16: 1307.4 TFLOPS (matrix) - same compute dies as MI300X, more HBM3e
+             return 1307.4e12
++        if "Ascend910" in device_name:
++            # Ascend 910B/C: ~320 TFLOPS BF16 (matrix)
++            return 320e12
+         else:
+             self._logger.warning(f"Peak FLOPS undefined for `{device_name}`. Falling back to A100 (312 TFLOPS)")
+             return 312e12
+diff --git a/src/prime_rl/trainer/rl/broadcast/__init__.py b/src/prime_rl/trainer/rl/broadcast/__init__.py
+index e419bda2f..86ed4c294 100644
+--- a/src/prime_rl/trainer/rl/broadcast/__init__.py
++++ b/src/prime_rl/trainer/rl/broadcast/__init__.py
+@@ -1,7 +1,6 @@
+ from pathlib import Path
+ 
+-import torch
+-
++from prime_rl._device import current_device
+ from prime_rl.configs.trainer import LoRAConfig, WeightBroadcastConfig
+ from prime_rl.trainer.rl.broadcast.base import WeightBroadcast
+ from prime_rl.trainer.rl.broadcast.filesystem import FileSystemWeightBroadcast
+@@ -12,7 +11,7 @@ def setup_weight_broadcast(
+     output_dir: Path, config: WeightBroadcastConfig, lora_config: LoRAConfig | None = None
+ ) -> WeightBroadcast:
+     if config.type == "nccl":
+-        return NCCLWeightBroadcast(output_dir, config, torch.cuda.current_device())
++        return NCCLWeightBroadcast(output_dir, config, current_device())
+     elif config.type == "filesystem":
+         return FileSystemWeightBroadcast(output_dir, config, lora_config)
+     else:
+diff --git a/src/prime_rl/trainer/rl/train.py b/src/prime_rl/trainer/rl/train.py
+index fbdfa99b3..90ccaaa06 100644
+--- a/src/prime_rl/trainer/rl/train.py
++++ b/src/prime_rl/trainer/rl/train.py
+@@ -7,6 +7,13 @@ from datetime import timedelta
+ # Import environment before any other imports
+ # ruff: noqa: I001
+ 
++from prime_rl._device import (
++    get_device,
++    get_device_string,
++    get_profiler_activity,
++    max_memory_reserved,
++    reset_peak_memory_stats,
++)
+ from prime_rl.trainer.models.layers.attn import substitute_ring_attn
+ from prime_rl.trainer.rl.broadcast import setup_weight_broadcast
+ from prime_rl.utils.act_offloading import maybe_activation_offloading
+@@ -118,7 +125,7 @@ def train(config: TrainerConfig):
+ 
+     # Setup multi run manager and offsets (including LoRA validation/scaling hooks if applicable)
+     multi_run_manager = setup_multi_run_manager(
+-        config.output_dir, config.max_concurrent_runs, torch.device("cuda", world.local_rank), config.model.lora
++        config.output_dir, config.max_concurrent_runs, get_device(world.local_rank), config.model.lora
+     )
+ 
+     # Initialize parallel dimensions
+@@ -249,11 +256,13 @@ def train(config: TrainerConfig):
+     maybe_record_function = nullcontext
+     if config.trace_path:
+         logger.info(f"Tracing to {config.trace_path}")
+-        prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True).__enter__()
++        npa = get_profiler_activity()
++        prof_activities = [ProfilerActivity.CPU] + ([npa] if npa is not None else [])
++        prof = profile(activities=prof_activities, record_shapes=True).__enter__()
+         maybe_record_function = record_function
+     while True:
+         # Reset peak memory stats
+-        torch.cuda.reset_peak_memory_stats()
++        reset_peak_memory_stats()
+         if gc_handler is not None:
+             gc_handler.run(progress.step)
+         is_last_step = config.max_steps is not None and progress.step == config.max_steps
+@@ -354,8 +363,9 @@ def train(config: TrainerConfig):
+         # divides by the same denominator. With a per-rank denominator, ranks with fewer loss
+         # tokens implicitly upweight their per-token gradient contribution after FSDP averaging.
+         # FSDP's per-rank divide is undone after the microbatch loop via fsdp_gradient_divide_factor.
++        dt = get_device_string()
+         local_loss_scale = sum(micro_batch["loss_mask"].sum().item() for micro_batch in micro_batches)
+-        global_loss_scale = torch.tensor(local_loss_scale, dtype=torch.int64, device="cuda")
++        global_loss_scale = torch.tensor(local_loss_scale, dtype=torch.int64, device=dt)
+         dp_cp_group = parallel_dims.get_mesh("dp_cp").get_group()
+         dist.all_reduce(global_loss_scale, op=dist.ReduceOp.SUM, group=dp_cp_group)
+         loss_scale = max(global_loss_scale.item(), 1)
+@@ -368,16 +378,16 @@ def train(config: TrainerConfig):
+         cp_size = parallel_dims.cp
+ 
+         for micro_step, micro_batch in enumerate(micro_batches):
+-            input_ids = micro_batch["input_ids"].to("cuda")
+-            position_ids = micro_batch["position_ids"].to("cuda")
+-            advantages = micro_batch["advantages"].to("cuda")
+-            loss_mask = micro_batch["loss_mask"].to("cuda")
+-            inference_logprobs = micro_batch["inference_logprobs"].to("cuda")
++            input_ids = micro_batch["input_ids"].to(dt)
++            position_ids = micro_batch["position_ids"].to(dt)
++            advantages = micro_batch["advantages"].to(dt)
++            loss_mask = micro_batch["loss_mask"].to(dt)
++            inference_logprobs = micro_batch["inference_logprobs"].to(dt)
+             teacher_logprobs = (
+-                micro_batch["teacher_logprobs"].to("cuda") if micro_batch["teacher_logprobs"] is not None else None
++                micro_batch["teacher_logprobs"].to(dt) if micro_batch["teacher_logprobs"] is not None else None
+             )
+             routed_experts = (
+-                micro_batch["routed_experts"].to("cuda") if micro_batch["routed_experts"] is not None else None
++                micro_batch["routed_experts"].to(dt) if micro_batch["routed_experts"] is not None else None
+             )
+ 
+             if routed_experts is None and config.enable_router_replay:
+@@ -394,9 +404,9 @@ def train(config: TrainerConfig):
+             # just {"pixel_values": ...} for Gemma3-VL) — we move every
+             # tensor to CUDA and let the model's forward sort them.
+             mm_kwargs_raw = micro_batch.get("mm_kwargs")
+-            mm_kwargs = {k: v.to("cuda") for k, v in mm_kwargs_raw.items()} if mm_kwargs_raw else None
++            mm_kwargs = {k: v.to(dt) for k, v in mm_kwargs_raw.items()} if mm_kwargs_raw else None
+             mm_token_type_ids = (
+-                micro_batch["mm_token_type_ids"].to("cuda")
++                micro_batch["mm_token_type_ids"].to(dt)
+                 if micro_batch.get("mm_token_type_ids") is not None
+                 else None
+             )
+@@ -418,7 +428,7 @@ def train(config: TrainerConfig):
+                 forward_position_ids = position_ids
+ 
+             if config.model.lora:
+-                lora_num_tokens = micro_batch["lora_num_tokens"].to("cuda")
++                lora_num_tokens = micro_batch["lora_num_tokens"].to(dt)
+                 if cp_enabled:
+                     chunk_size = input_ids.shape[1]
+                     # Convert to cumsum, adjust for CP chunk, convert back to num_tokens
+@@ -429,7 +439,7 @@ def train(config: TrainerConfig):
+                     )
+                 set_lora_num_tokens(lora_num_tokens)
+ 
+-            temperatures = micro_batch["temperatures"].to("cuda")
++            temperatures = micro_batch["temperatures"].to(dt)
+ 
+             # Shard temperatures for context parallelism if enabled
+             if cp_enabled:
+@@ -563,7 +573,7 @@ def train(config: TrainerConfig):
+                 model.parameters(), max_norm=config.optim.max_norm, ep_enabled=parallel_dims.ep_enabled
+             )
+             if grad_norm.device.type == "cpu":
+-                grad_norm = grad_norm.to(torch.device("cuda"))
++                grad_norm = grad_norm.to(get_device())
+ 
+         zero_grad_ratio = get_zero_gradient_ratio(model.parameters(), parallel_dims.dp_replicate)
+ 
+@@ -595,7 +605,7 @@ def train(config: TrainerConfig):
+         perf_counter = get_perf_counter(model, seq_len)
+         throughput = perf_counter.get_step_tokens_per_second(num_tokens, forward_backward_time)
+         mfu = perf_counter.get_step_mfu(num_tokens, forward_backward_time)
+-        peak_memory = torch.cuda.max_memory_reserved() / 1024**3  # GiB
++        peak_memory = max_memory_reserved() / 1024**3  # GiB
+ 
+         # Log step metrics
+         step_time = time.perf_counter() - step_start_time
+diff --git a/src/prime_rl/trainer/utils.py b/src/prime_rl/trainer/utils.py
+index 9a8a86a52..95b1be697 100644
+--- a/src/prime_rl/trainer/utils.py
++++ b/src/prime_rl/trainer/utils.py
+@@ -69,7 +69,9 @@ def count_zero_gradient_elements(parameters: Iterable[nn.Parameter]) -> tuple[Te
+     metric instead of silently dropping them from the count.
+     """
+ 
+-    device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
++    from prime_rl._device import get_device_string, current_device
++
++    device = torch.device(get_device_string(), current_device())
+     num_zeros = torch.zeros((), dtype=torch.long, device=device)
+     num_tracked = torch.zeros((), dtype=torch.long, device=device)
+ 
+@@ -131,14 +133,15 @@ def get_ckpt_disk_metrics(output_dir: Path) -> dict[str, float]:
+ 
+ 
+ def setup_torch_distributed(timeout: timedelta = DEFAULT_TIMEOUT, enable_gloo: bool = False):
++    from prime_rl._device import get_dist_backend, set_device
++
+     device_id = get_world().local_rank
+-    torch.cuda.set_device(device_id)
+-    # Use Gloo backend for CPU and NCCL for GPU when CPU offloading is enabled
+-    # Otherwise use NCCL for better GPU performance
+-    backend = None  # by default nccl
++    set_device(device_id)
++    # Use Gloo backend for CPU and device-specific backend for accelerator when CPU offloading
++    # is enabled. Otherwise use the default backend for best performance.
++    backend = get_dist_backend(enable_gloo)
+     if enable_gloo:
+-        get_logger().info("Using Gloo backend for CPU and NCCL backend for GPU")
+-        backend = "cpu:gloo,cuda:nccl"
++        get_logger().info(f"Using Gloo backend for CPU and {backend} backend for accelerator")
+ 
+     dist.init_process_group(backend=backend, timeout=timeout, device_id=device_id)
+ 
+@@ -243,7 +246,7 @@ def print_benchmark(history: dict[str, list[Any]]) -> None:
+             lambda row: f"{row['mean']} ± {row['std']} [{row['min']}, {row['max']}]", axis=1
+         ).tolist()
+         + [
+-            f"{format_num(mean_df['Peak Memory']['mean'], precision=1)} GiB ({mean_df['Peak Memory']['mean'] / (torch.cuda.mem_get_info()[1] / 1024**3) * 100:.1f}%)"
++            f"{format_num(mean_df['Peak Memory']['mean'], precision=1)} GiB ({mean_df['Peak Memory']['mean'] / (mem_get_info()[1] / 1024**3) * 100:.1f}%)"
+         ]
+     )
+     table.add_row(*mean_row)
+@@ -276,7 +279,9 @@ def export_benchmark_json(history: dict[str, list[Any]], output_path: Path) -> N
+     stats = df.describe().loc[["mean", "std", "min", "max"], :]
+ 
+     # Get peak memory percentage
+-    total_memory_gib = torch.cuda.mem_get_info()[1] / 1024**3
++    from prime_rl._device import mem_get_info
++
++    total_memory_gib = mem_get_info()[1] / 1024**3
+     peak_memory_pct = stats["peak_memory"]["mean"] / total_memory_gib * 100
+ 
+     result = {
+@@ -360,8 +365,11 @@ class Tensors(defaultdict):
+         metrics = {}
+         for key in keys:
+             # All-gather tensors across steps and ranks (get global distribution)
++            from prime_rl._device import get_device_string
++
+             values = self.pop(key, [])
+-            tensors = torch.cat(values, dim=0).to("cuda") if values else torch.empty(0, device="cuda")
++            dt = get_device_string()
++            tensors = torch.cat(values, dim=0).to(dt) if values else torch.empty(0, device=dt)
+             assert tensors.ndim == 1, "Can only aggregate 1D tensors"
+             tensors = flexible_all_gather(tensors)
+             assert tensors.ndim == 1, "Can only aggregate 1D tensors"
+@@ -430,20 +438,24 @@ MEMORY_SNAPSHOT_MAX_ENTRIES = 100000
+ 
+ class MemoryProfiler:
+     def __init__(self, step_num: int, snapshot_path: Path):
+-        torch.cuda.memory._record_memory_history(max_entries=MEMORY_SNAPSHOT_MAX_ENTRIES)
++        from prime_rl._device import record_memory_history
++
++        record_memory_history(max_entries=MEMORY_SNAPSHOT_MAX_ENTRIES)
+         self.logger = get_logger()
+         snapshot_path.mkdir(parents=True, exist_ok=True)
+         self.snapshot_path = snapshot_path
+         self.step_num = step_num
+ 
+     def step(self):
++        from prime_rl._device import memory_snapshot
++
+         self.logger.info(f"Dumping memory snapshot at step {self.step_num} at {self.snapshot_path}")
+         begin = time.monotonic()
+         step_folder = self.snapshot_path / f"step_{self.step_num}"
+         step_folder.mkdir(parents=True, exist_ok=True)
+         file_path = step_folder / f"rank_{get_world().rank}.pickle"
+         with open(file_path, "wb") as output:
+-            pickle.dump(torch.cuda.memory._snapshot(), output)
++            pickle.dump(memory_snapshot(), output)
+         self.logger.info(
+             f"Finished dumping memory snapshot in {time.monotonic() - begin:.2f} seconds, load {file_path} at https://docs.pytorch.org/memory_viz to visualize the memory usage"
+         )
+diff --git a/src/prime_rl/utils/nccl.py b/src/prime_rl/utils/nccl.py
+index bb581ceeb..15d87f4a8 100644
+--- a/src/prime_rl/utils/nccl.py
++++ b/src/prime_rl/utils/nccl.py
+@@ -1,20 +1,23 @@
+ import os
+ 
+-import pynvml
+-
+ from prime_rl.utils.logger import get_logger
+ 
+ 
+ def disable_nccl_p2p_if_unavailable() -> None:
+-    """Disable NCCL P2P/SHM transports when GPUs lack NVLink interconnect.
++    """Disable NCCL/HCCL P2P/SHM transports when devices lack direct interconnect.
+ 
+-    In environments without NVLink (e.g. PCIe-only or VMs with GPU passthrough),
+-    NCCL's P2P and SHM transports can fail because they rely on CUDA IPC which
+-    requires peer access. Disabling them forces NCCL to use socket-based transport.
++    In environments without NVLink or HCCS (e.g. PCIe-only or VMs with device
++    passthrough), P2P and SHM transports can fail because they rely on device IPC
++    which requires peer access. Disabling them forces use of socket-based transport.
+ 
+-    Uses pynvml to check physical GPU topology, which works regardless of
+-    CUDA_VISIBLE_DEVICES restrictions on the current process.
++    Uses pynvml to check physical GPU topology on CUDA, skips gracefully on NPU.
+     """
++    try:
++        import pynvml
++    except ImportError:
++        # Non-CUDA platform (e.g. Ascend NPU) — skip NVLink check
++        return
++
+     pynvml.nvmlInit()
+     try:
+         n = pynvml.nvmlDeviceGetCount()
+diff --git a/src/prime_rl/utils/utils.py b/src/prime_rl/utils/utils.py
+index dec33f625..3e63c2521 100644
+--- a/src/prime_rl/utils/utils.py
++++ b/src/prime_rl/utils/utils.py
+@@ -191,12 +191,16 @@ def get_free_port() -> int:
+ 
+ 
+ def get_cuda_visible_devices() -> list[int]:
+-    """Returns the list of availble CUDA devices, taking into account the CUDA_VISIBLE_DEVICES environment variable."""
+-    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+-    if cuda_visible is None:
++    """Returns the list of availble accelerator devices, taking into account the
++    CUDA_VISIBLE_DEVICES / ASCEND_RT_VISIBLE_DEVICES environment variable."""
++    from prime_rl._device import device_count, get_visible_devices_env
++
++    visible_env = get_visible_devices_env()
++    visible = os.environ.get(visible_env)
++    if visible is None:
+         # Default to all devices if the environment variable is not set
+-        return list(range(torch.cuda.device_count()))
+-    return list(sorted([int(device) for device in cuda_visible.split(",")]))
++        return list(range(device_count()))
++    return list(sorted([int(device) for device in visible.split(",")]))
+ 
+ 
+ def get_latest_ckpt_step(weights_dir: Path) -> int | None:

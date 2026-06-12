@@ -191,12 +191,16 @@ def get_free_port() -> int:
 
 
 def get_cuda_visible_devices() -> list[int]:
-    """Returns the list of availble CUDA devices, taking into account the CUDA_VISIBLE_DEVICES environment variable."""
-    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if cuda_visible is None:
+    """Returns the list of availble accelerator devices, taking into account the
+    CUDA_VISIBLE_DEVICES / ASCEND_RT_VISIBLE_DEVICES environment variable."""
+    from prime_rl._device import device_count, get_visible_devices_env
+
+    visible_env = get_visible_devices_env()
+    visible = os.environ.get(visible_env)
+    if visible is None:
         # Default to all devices if the environment variable is not set
-        return list(range(torch.cuda.device_count()))
-    return list(sorted([int(device) for device in cuda_visible.split(",")]))
+        return list(range(device_count()))
+    return list(sorted([int(device) for device in visible.split(",")]))
 
 
 def get_latest_ckpt_step(weights_dir: Path) -> int | None:

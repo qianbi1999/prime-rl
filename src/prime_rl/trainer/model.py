@@ -454,16 +454,24 @@ def get_model(
             )
 
     # GPT-OSS only supports FlashAttention via kernels-community/vllm-flash-attn3, which requires Hopper (SM 90).
-    # On other architectures (e.g. Blackwell), users must fall back to eager attention.
+    # On other architectures (e.g. Blackwell, Ascend NPU), users must fall back to eager attention.
     HOPPER_MAJOR = 9
     if getattr(model_config, "model_type", "") == "gpt_oss":
         if config.attn != "eager":
-            major, minor = torch.cuda.get_device_capability()
-            if major != HOPPER_MAJOR:
+            # NPU / non-NVIDIA: skip compute capability check, assume eager is needed
+            try:
+                major, minor = torch.cuda.get_device_capability()
+                if major != HOPPER_MAJOR:
+                    raise ValueError(
+                        f"GPT-OSS requires 'attn = \"eager\"' on non-Hopper GPUs (detected SM {major}{minor}). "
+                        f"The only flash attention kernel supported by GPT-OSS (kernels-community/vllm-flash-attn3) is Hopper-only. "
+                        f'Set [trainer.model] attn = "eager" in your config.'
+                    )
+            except (RuntimeError, AssertionError):
+                # No CUDA device available — assume non-Hopper
                 raise ValueError(
-                    f"GPT-OSS requires 'attn = \"eager\"' on non-Hopper GPUs (detected SM {major}{minor}). "
-                    f"The only flash attention kernel supported by GPT-OSS (kernels-community/vllm-flash-attn3) is Hopper-only. "
-                    f'Set [trainer.model] attn = "eager" in your config.'
+                    "GPT-OSS requires 'attn = \"eager\"' on non-Hopper / non-CUDA devices. "
+                    "Set [trainer.model] attn = \"eager\" in your config."
                 )
         # Enable hub kernels for GPT-OSS (disabled by default to avoid interfering with other models).
         import transformers.integrations.hub_kernels as _hub_kernels
@@ -728,7 +736,9 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
 
 
 def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
-    device = "cpu" if config.fsdp_cpu_offload else "cuda"
+    from prime_rl._device import get_device_string
+
+    device = "cpu" if config.fsdp_cpu_offload else get_device_string()
     model.to_empty(device=device)
     torch.distributed.barrier()
 
@@ -814,11 +824,12 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
         if parallel_dims.dp_replicate_enabled:
             # Synchronize LoRA initialization across dp_replicate ranks by broadcasting a seed
             dp_replicate_mesh = parallel_dims.world_mesh["dp_replicate"]
-            seed_tensor = torch.empty(1, dtype=torch.long, device="cuda")
+            dt = get_device_string()
+            seed_tensor = torch.empty(1, dtype=torch.long, device=dt)
             if dp_replicate_mesh.get_local_rank() == 0:
                 seed_tensor.random_()
             torch.distributed.broadcast(seed_tensor, src=0, group=dp_replicate_mesh.get_group())
-            generator = torch.Generator(device="cuda").manual_seed(seed_tensor.item())
+            generator = torch.Generator(device=dt).manual_seed(seed_tensor.item())
         for module in lora_modules:
             module._init_lora_parameters(generator)
     logger.debug(f"Loaded weights using HF DCP in {time.perf_counter() - load_dcp_start_time:.2f} seconds")
@@ -975,12 +986,15 @@ def apply_ep(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims)
 
 
 def _move_buffers_to_cuda(model: nn.Module, config: ModelConfig) -> None:
-    """FSDP CPU offloading only manages parameters, not buffers. Move buffers to CUDA."""
+    """FSDP CPU offloading only manages parameters, not buffers. Move buffers to device."""
+    from prime_rl._device import get_device_string
+
     if not config.fsdp_cpu_offload:
         return
+    dt = get_device_string()
     for _, buffer in model.named_buffers():
         if buffer.device.type == "cpu":
-            buffer.data = buffer.data.to("cuda")
+            buffer.data = buffer.data.to(dt)
 
 
 def _reset_runtime_moe_buffers(model: nn.Module) -> None:
@@ -1099,11 +1113,13 @@ def setup_model(
     # 2. if we can load to meta, we either:
     if possible_to_load_to_meta:
         # - load from checkpoint later if needed
+        from prime_rl._device import get_device_string as _gds2
+
         if loading_from_checkpoint_later:
             logger.warning(
                 "Skipping loading weights. Initializing an empty model on device, loading from checkpoint later."
             )
-            device = "cpu" if config.fsdp_cpu_offload else "cuda"
+            device = "cpu" if config.fsdp_cpu_offload else _gds2()
             model.to_empty(device=device)
             torch.distributed.barrier()
             if isinstance(model, PreTrainedModelPrimeRL):

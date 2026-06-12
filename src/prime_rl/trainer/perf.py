@@ -33,7 +33,11 @@ class PerfCounter:
         self._world = get_world()
         self._logger = get_logger()
 
-        if torch.cuda.is_available():
+        from prime_rl._device import device_type, device_module, get_device_string
+
+        if device_type == "npu" and device_module.device_count() > 0:
+            self.gpu_peak_flops = self._get_peak_flops(device_module.get_device_name(0))
+        elif torch.cuda.is_available():
             self.gpu_peak_flops = self._get_peak_flops(torch.cuda.get_device_name(torch.device("cuda")))
         else:
             self.gpu_peak_flops = 0
@@ -101,6 +105,9 @@ class PerfCounter:
             # https://www.amd.com/en/products/accelerators/instinct/mi300/mi325x.html
             # Peak BF16: 1307.4 TFLOPS (matrix) - same compute dies as MI300X, more HBM3e
             return 1307.4e12
+        if "Ascend910" in device_name:
+            # Ascend 910B/C: ~320 TFLOPS BF16 (matrix)
+            return 320e12
         else:
             self._logger.warning(f"Peak FLOPS undefined for `{device_name}`. Falling back to A100 (312 TFLOPS)")
             return 312e12

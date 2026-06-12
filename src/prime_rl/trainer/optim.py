@@ -3,7 +3,6 @@ import time
 from typing import Callable
 
 import torch
-from dion import Muon
 from torch import nn
 from torch.distributed.tensor import DTensor
 from torch.optim import SGD, AdamW, Optimizer
@@ -64,8 +63,10 @@ class CPUOffloadOptimizer:
             self._initialized = True
             return result
 
-        # Move states to GPU
-        self._move_states("cuda")
+        from prime_rl._device import get_device_string
+
+        # Move states to device
+        self._move_states(get_device_string())
 
         # Run optimizer step
         result = self.optimizer.step(closure)
@@ -79,10 +80,12 @@ class CPUOffloadOptimizer:
         self.optimizer.zero_grad(set_to_none=set_to_none)
 
     def state_dict(self):
-        # Move to GPU temporarily for consistent state dict
+        # Move to device temporarily for consistent state dict
         if self._initialized:
-            self._move_states("cuda")
-            torch.cuda.synchronize()
+            from prime_rl._device import get_device_string, synchronize
+
+            self._move_states(get_device_string())
+            synchronize()
         sd = self.optimizer.state_dict()
         if self._initialized:
             self._move_states("cpu")
@@ -243,6 +246,8 @@ def _create_muon_optimizer(
         distributed_mesh = parallel_dims.get_mesh("dp_shard_cp")
     else:
         distributed_mesh = parallel_dims.world_mesh
+
+    from dion import Muon  # noqa: F811
 
     optimizer = Muon(
         params=param_groups,

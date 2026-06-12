@@ -72,12 +72,14 @@ class AppState(Stateful):
 
     def state_dict(self) -> dict[str, Any]:
         # get_state_dict requires optimizer states to live on param.device. For an
-        # already-initialized CPU-offload optimizer that means staging back to GPU
+        # already-initialized CPU-offload optimizer that means staging back to device
         # before the call; the matching offload happens after the dict is built.
+        from prime_rl._device import get_device_string, synchronize
+
         for opt in self.optimizers:
             if isinstance(opt, CPUOffloadOptimizer) and opt._initialized:
-                opt._move_states("cuda")
-                torch.cuda.synchronize()
+                opt._move_states(get_device_string())
+                synchronize()
 
         # Automatically manages FSDP FQN's, as well as sets the default state dict type to FSDP.SHARDED_STATE_DICT
         base_optimizers = self._get_base_optimizers()
@@ -109,7 +111,9 @@ class AppState(Stateful):
                 opt._move_states("cpu")
         if has_cpu_offload:
             gc.collect()
-            torch.cuda.empty_cache()
+            from prime_rl._device import empty_cache
+
+            empty_cache()
 
         return state_dict
 
@@ -151,9 +155,11 @@ class AppState(Stateful):
         # it drops the last references to the loaded tensor wrappers so the cuda
         # allocator can release whatever blocks it cached during the read.
         if has_cpu_offload:
+            from prime_rl._device import empty_cache
+
             state_dict.clear()
             gc.collect()
-            torch.cuda.empty_cache()
+            empty_cache()
 
 
 class CheckpointManager:

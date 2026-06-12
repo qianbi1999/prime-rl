@@ -1,0 +1,61 @@
+# Minimal NPU RL Training Requirements
+# ====================================
+# These are the minimal pip-installable packages needed to run
+# prime-rl Wordle RL on Ascend NPU (910C).
+#
+# Packages already in the NPU environment (skip):
+#   torch==2.10.0+cpu, torch_npu==2.10.0
+#   torchvision, torchaudio
+#   vllm==0.20.2, vllm_ascend==0.20.2rc1
+#   transformers==5.5.3
+#   triton_ascend==3.2.1
+#   loguru, openai, pyzmq, rich, setproctitle, uvloop
+#   numpy, pydantic, pybase64
+#
+# CUDA-only packages deliberately EXCLUDED (not available on NPU):
+#   liger-kernel, flash-attn, flash-attn-3, flash-attn-cute
+#   ring-flash-attn, flash-linear-attention, tilelang
+#   nvidia-ml-py, mooncake-transfer-engine
+#   deep-ep, deep-gemm, nixl, nixl-cu12
+# =============================================
+
+# --- Mandatory: core runtime ---
+beartype>=0.21.0
+jaxtyping>=0.3.2
+pyarrow>=21.0.0
+datasets>=4.0.0
+torchdata>=0.11.0
+
+# --- Mandatory: orchestrator / networking ---
+aiolimiter>=1.2.1
+tenacity>=8.2.0
+orjson>=3.11.0
+
+# --- Mandatory: logging / monitoring ---
+wandb>=0.26.1
+
+# --- Mandatory: environment manager ---
+prime>=0.6.4
+
+# --- Internal packages (installed via uv editable) ---
+# These are local to the repo — NOT pip-installable:
+#
+#   packages/prime-rl-configs        → prime-rl-configs
+#   deps/pydantic-config             → prime-pydantic-config
+#   deps/verifiers                   → verifiers
+#   deps/renderers                   → renderers
+#
+# Git dependencies (fetched by uv):
+#
+#   torchtitan @ git+https://github.com/pytorch/torchtitan@a1fdd7e
+#   dion       (pin in pyproject.toml)
+#
+# Install all of these with:
+#   uv sync --no-dev
+# Or if uv sync pulls CUDA deps, manually:
+#   uv pip install -e packages/prime-rl-configs
+#   uv pip install -e deps/pydantic-config
+#   uv pip install -e deps/verifiers
+#   uv pip install -e deps/renderers
+#   uv pip install git+https://github.com/pytorch/torchtitan@a1fdd7e
+#   uv pip install dion  # check pyproject.toml for exact pin

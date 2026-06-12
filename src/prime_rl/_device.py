@@ -1,0 +1,160 @@
+"""Device abstraction layer for NPU (Ascend) / CUDA portability.
+
+Import this module instead of hardcoding ``"cuda"`` or ``torch.cuda.*`` calls.
+On Ascend NPUs the module redirects to ``torch.npu`` and ``hccl``; on CUDA GPUs
+it stays on the original path.
+
+Usage::
+
+    from prime_rl._device import device_type, device_module, get_device, get_device_string
+
+    # String for torch.device() and .to(...) calls:
+    x = tensor.to(get_device_string())
+
+    # torch.device object:
+    dev = get_device(local_rank)
+
+    # For torch.X.set_device:
+    device_module.set_device(local_rank)
+
+    # Backend string for dist.init_process_group:
+    backend = get_dist_backend(enable_gloo=False)
+"""
+
+from __future__ import annotations
+
+import torch
+
+# -- Detection -----------------------------------------------------------
+_HAS_NPU = hasattr(torch, "npu") and torch.npu.is_available()
+_HAS_CUDA = torch.cuda.is_available()
+
+if _HAS_NPU:
+    device_type: str = "npu"
+    device_module = torch.npu
+    _DIST_BACKEND = "hccl"
+elif _HAS_CUDA:
+    device_type = "cuda"
+    device_module = torch.cuda
+    _DIST_BACKEND = "nccl"
+else:
+    # Fallback: assume NPU if torch_npu is imported (even if not detected)
+    device_type = "npu"
+    device_module = getattr(torch, "npu", torch.cuda)
+    _DIST_BACKEND = "hccl" if hasattr(torch, "npu") else "nccl"
+
+
+def get_device_string() -> str:
+    """Return the device type string (``"npu"`` or ``"cuda"``)."""
+    return device_type
+
+
+def get_device(local_rank: int = -1) -> torch.device:
+    """Return a ``torch.device`` for the detected accelerator.
+
+    When ``local_rank >= 0``, the index targets a specific device (e.g. for
+    ``torch.device("npu", 0)``).  When ``-1``, returns the generic device
+    (``torch.device("npu")``).
+    """
+    if local_rank >= 0:
+        return torch.device(device_type, local_rank)
+    return torch.device(device_type)
+
+
+def get_dist_backend(enable_gloo: bool = False) -> str | None:
+    """Return the distributed backend string for ``init_process_group``.
+
+    When ``enable_gloo=True``, returns ``"cpu:gloo,{device}:{comm_backend}"``
+    for CPU offloading scenarios. Otherwise returns ``None`` (the default,
+    which is HCCL on NPU / NCCL on CUDA).
+    """
+    if enable_gloo:
+        return f"cpu:gloo,{device_type}:{_DIST_BACKEND}"
+    return None  # default backend
+
+
+def get_visible_devices_env() -> str:
+    """Environment variable name for visible device selection."""
+    return "ASCEND_RT_VISIBLE_DEVICES" if device_type == "npu" else "CUDA_VISIBLE_DEVICES"
+
+
+def get_alloc_conf_env() -> str:
+    """Environment variable name for PyTorch memory allocator configuration."""
+    return "PYTORCH_NPU_ALLOC_CONF" if device_type == "npu" else "PYTORCH_CUDA_ALLOC_CONF"
+
+
+def get_profiler_activity():
+    """Return the device-appropriate ``ProfilerActivity`` enum value."""
+    if device_type == "npu":
+        # Ascend NPU uses its own profiler activity
+        try:
+            from torch_npu.profiler import ProfilerActivity as NpuProfilerActivity
+            return NpuProfilerActivity.NPU
+        except ImportError:
+            return None  # profiling not supported
+    return torch.profiler.ProfilerActivity.CUDA
+
+
+def get_peak_flops() -> float:
+    """Return peak BF16 FLOPS for the detected device."""
+    if device_type == "npu":
+        name = device_module.get_device_name(0) if device_module.device_count() > 0 else ""
+        if "910" in name:
+            # Ascend 910B/C: ~320 TFLOPS BF16 (matrix)
+            return 320e12
+        return 312e12  # fallback
+    # CUDA path — delegated to PerfCounter._get_peak_flops
+    return 0.0  # caller should use PerfCounter's logic
+
+
+def reset_peak_memory_stats() -> None:
+    """Reset peak memory statistics."""
+    device_module.reset_peak_memory_stats()
+
+
+def max_memory_reserved() -> float:
+    """Return max reserved memory in bytes."""
+    return device_module.max_memory_reserved()
+
+
+def mem_get_info(device_index: int | None = None):
+    """Return (free_bytes, total_bytes) tuple for the device."""
+    return device_module.mem_get_info(device_index)
+
+
+def set_device(device_index: int) -> None:
+    """Set the current device."""
+    device_module.set_device(device_index)
+
+
+def current_device() -> int:
+    """Return the current device index."""
+    return device_module.current_device()
+
+
+def device_count() -> int:
+    """Return the number of available devices."""
+    return device_module.device_count()
+
+
+def synchronize() -> None:
+    """Synchronize the device."""
+    device_module.synchronize()
+
+
+def empty_cache() -> None:
+    """Empty the device memory cache."""
+    device_module.empty_cache()
+
+
+def record_memory_history(max_entries: int = 100000) -> None:
+    """Start recording memory allocation history."""
+    if hasattr(device_module, "memory") and hasattr(device_module.memory, "_record_memory_history"):
+        device_module.memory._record_memory_history(max_entries=max_entries)
+
+
+def memory_snapshot():
+    """Take a memory snapshot. Returns a dict suitable for pickle."""
+    if hasattr(device_module, "memory") and hasattr(device_module.memory, "_snapshot"):
+        return device_module.memory._snapshot()
+    return {}

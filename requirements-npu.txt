@@ -5,13 +5,15 @@
 # CUDA-only packages deliberately EXCLUDED:
 #   liger-kernel, flash-attn*, ring-flash-attn, flash-linear-attention,
 #   nvidia-ml-py, mooncake-transfer-engine, deep-ep, deep-gemm, tilelang
+#
+# torchdata must be installed with --no-deps to avoid pulling torch:
+#   pip install --no-deps torchdata>=0.11.0
 
 # --- core runtime ---
 beartype>=0.21.0
 jaxtyping>=0.3.2
 pyarrow>=21.0.0
 datasets>=4.0.0
-torchdata>=0.11.0
 
 # --- orchestrator / networking ---
 aiolimiter>=1.2.1

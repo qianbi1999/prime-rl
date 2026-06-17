@@ -653,3 +653,29 @@ index dec33f625..3e63c2521 100644
  
  
  def get_latest_ckpt_step(weights_dir: Path) -> int | None:
+diff --git a/packages/prime-rl-configs/pyproject.toml b/packages/prime-rl-configs/pyproject.toml
+index 55ae0a5b4..be5627807 100644
+--- a/packages/prime-rl-configs/pyproject.toml
++++ b/packages/prime-rl-configs/pyproject.toml
+@@ -3,7 +3,7 @@ name = "prime-rl-configs"
+ version = "0.4.0"
+ description = "Slim config schema for prime-rl (no GPU/ML deps)."
+ readme = "README.md"
+-requires-python = "~=3.12.0"
++requires-python = ">=3.11"
+ dependencies = [
+     "pydantic>=1.10.13",
+     "prime-pydantic-config>=0.3.0.dev82",
+diff --git a/pyproject.toml b/pyproject.toml
+index 4f0255448..2e8a7ec82 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -3,7 +3,7 @@ name = "prime-rl"
+ version = "0.5.0"
+ description = "Async RL Training at Scale"
+ readme = "README.md"
+-requires-python = "~=3.12.0"
++requires-python = ">=3.11"
+ dependencies = [
+     "prime-rl-configs",
+     "prime-pydantic-config",

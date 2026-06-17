@@ -50,7 +50,7 @@ pip install -e deps/verifiers/environments/wordle
 ### 3. NLTK 数据
 
 ```bash
-python3 -c "import nltk; nltk.download('averaged_perceptron_tagger_eng')"
+python3 -c "import nltk; nltk.download('averaged_perceptron_tagger_eng'); nltk.download('words')"
 ```
 
 ### 4. 准备模型权重

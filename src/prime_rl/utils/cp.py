@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 import torch.distributed.nn as dist_nn
 import torch.nn as nn
+from ring_flash_attn import update_ring_flash_attn_params
 
 from prime_rl.utils.sequence import get_cu_seqlens_from_position_ids
 
@@ -204,8 +205,6 @@ def setup_cp_params(
     cu_seqlens, max_seqlen = get_cu_seqlens_from_position_ids(position_ids)
 
     if cp_style == "ring":
-        from ring_flash_attn import update_ring_flash_attn_params  # noqa: F811
-
         update_ring_flash_attn_params(cu_seqlens, cp_group)
     elif cp_style == "ulysses":
         # Delayed import: ulysses_attn lives under trainer.models, which imports

@@ -21,11 +21,13 @@ from dataclasses import dataclass
 from functools import cached_property
 
 import torch.distributed as dist
+from torch._utils import _get_available_device_type
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 from prime_rl.configs.trainer import ModelConfig
-from prime_rl._device import device_type
 from prime_rl.utils.logger import get_logger
+
+device_type = _get_available_device_type() or "cuda"
 
 __all__ = ["ParallelDims"]
 

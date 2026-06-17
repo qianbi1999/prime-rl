@@ -9,9 +9,8 @@ from pathlib import Path
 from subprocess import Popen
 from threading import Event, Thread
 
+import pynvml
 import tomli_w
-
-from prime_rl._device import device_count, get_visible_devices_env, get_alloc_conf_env
 
 from prime_rl.configs.rl import RLConfig
 from prime_rl.utils.config import cli
@@ -35,10 +34,11 @@ INFERENCE_TOML = "inference.toml"
 
 
 def get_physical_gpu_ids() -> list[int]:
-    """Return physical device IDs visible to the launcher."""
-    raw_visible = os.environ.get(get_visible_devices_env())
+    """Return physical GPU IDs visible to the launcher."""
+    raw_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     if raw_visible is None:
-        return list(range(device_count()))
+        pynvml.nvmlInit()
+        return list(range(pynvml.nvmlDeviceGetCount()))
     return [int(token.strip()) for token in raw_visible.split(",") if token.strip()]
 
 
@@ -160,7 +160,7 @@ def rl_local(config: RLConfig):
                     inference_cmd,
                     env={
                         **os.environ,
-                        get_visible_devices_env(): ",".join(map(str, infer_gpu_ids)),
+                        "CUDA_VISIBLE_DEVICES": ",".join(map(str, infer_gpu_ids)),
                     },
                     stdout=log_file,
                     stderr=log_file,
@@ -252,9 +252,9 @@ def rl_local(config: RLConfig):
                     **os.environ,
                     **wandb_shared_env,
                     "WANDB_SHARED_LABEL": "trainer",
-                    get_visible_devices_env(): ",".join(map(str, trainer_gpu_ids)),
+                    "CUDA_VISIBLE_DEVICES": ",".join(map(str, trainer_gpu_ids)),
                     "PYTHONUNBUFFERED": "1",
-                    get_alloc_conf_env(): "expandable_segments:True",
+                    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
                     "LOGURU_FORCE_COLORS": "1",
                     "WANDB_PROGRAM": "uv run rl",
                     "WANDB_ARGS": json.dumps(start_command),

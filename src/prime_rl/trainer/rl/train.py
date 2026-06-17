@@ -7,13 +7,6 @@ from datetime import timedelta
 # Import environment before any other imports
 # ruff: noqa: I001
 
-from prime_rl._device import (
-    get_device,
-    get_device_string,
-    get_profiler_activity,
-    max_memory_reserved,
-    reset_peak_memory_stats,
-)
 from prime_rl.trainer.models.layers.attn import substitute_ring_attn
 from prime_rl.trainer.rl.broadcast import setup_weight_broadcast
 from prime_rl.utils.act_offloading import maybe_activation_offloading
@@ -73,6 +66,7 @@ from prime_rl.utils.monitor import setup_monitor
 from prime_rl.utils.config import cli
 from prime_rl.utils.process import set_proc_title
 from prime_rl.utils.utils import clean_exit, resolve_latest_ckpt_step, to_col_format
+from ring_flash_attn import substitute_hf_flash_attn
 from torchtitan.distributed.utils import clip_grad_norm_
 
 
@@ -124,7 +118,7 @@ def train(config: TrainerConfig):
 
     # Setup multi run manager and offsets (including LoRA validation/scaling hooks if applicable)
     multi_run_manager = setup_multi_run_manager(
-        config.output_dir, config.max_concurrent_runs, get_device(world.local_rank), config.model.lora
+        config.output_dir, config.max_concurrent_runs, torch.device("cuda", world.local_rank), config.model.lora
     )
 
     # Initialize parallel dimensions
@@ -195,8 +189,6 @@ def train(config: TrainerConfig):
         cp_group = parallel_dims.world_mesh["cp"].get_group()
         cp_rank = parallel_dims.world_mesh["cp"].get_local_rank()
         if config.model.cp_style == "ring":
-            from ring_flash_attn import substitute_hf_flash_attn  # noqa: F811
-
             substitute_hf_flash_attn(cp_group, heads_k_stride=1)
             substitute_ring_attn(cp_group, heads_k_stride=1, attn_impl=config.model.attn)
         else:
@@ -257,13 +249,11 @@ def train(config: TrainerConfig):
     maybe_record_function = nullcontext
     if config.trace_path:
         logger.info(f"Tracing to {config.trace_path}")
-        npa = get_profiler_activity()
-        prof_activities = [ProfilerActivity.CPU] + ([npa] if npa is not None else [])
-        prof = profile(activities=prof_activities, record_shapes=True).__enter__()
+        prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True).__enter__()
         maybe_record_function = record_function
     while True:
         # Reset peak memory stats
-        reset_peak_memory_stats()
+        torch.cuda.reset_peak_memory_stats()
         if gc_handler is not None:
             gc_handler.run(progress.step)
         is_last_step = config.max_steps is not None and progress.step == config.max_steps
@@ -364,9 +354,8 @@ def train(config: TrainerConfig):
         # divides by the same denominator. With a per-rank denominator, ranks with fewer loss
         # tokens implicitly upweight their per-token gradient contribution after FSDP averaging.
         # FSDP's per-rank divide is undone after the microbatch loop via fsdp_gradient_divide_factor.
-        dt = get_device_string()
         local_loss_scale = sum(micro_batch["loss_mask"].sum().item() for micro_batch in micro_batches)
-        global_loss_scale = torch.tensor(local_loss_scale, dtype=torch.int64, device=dt)
+        global_loss_scale = torch.tensor(local_loss_scale, dtype=torch.int64, device="cuda")
         dp_cp_group = parallel_dims.get_mesh("dp_cp").get_group()
         dist.all_reduce(global_loss_scale, op=dist.ReduceOp.SUM, group=dp_cp_group)
         loss_scale = max(global_loss_scale.item(), 1)
@@ -379,16 +368,16 @@ def train(config: TrainerConfig):
         cp_size = parallel_dims.cp
 
         for micro_step, micro_batch in enumerate(micro_batches):
-            input_ids = micro_batch["input_ids"].to(dt)
-            position_ids = micro_batch["position_ids"].to(dt)
-            advantages = micro_batch["advantages"].to(dt)
-            loss_mask = micro_batch["loss_mask"].to(dt)
-            inference_logprobs = micro_batch["inference_logprobs"].to(dt)
+            input_ids = micro_batch["input_ids"].to("cuda")
+            position_ids = micro_batch["position_ids"].to("cuda")
+            advantages = micro_batch["advantages"].to("cuda")
+            loss_mask = micro_batch["loss_mask"].to("cuda")
+            inference_logprobs = micro_batch["inference_logprobs"].to("cuda")
             teacher_logprobs = (
-                micro_batch["teacher_logprobs"].to(dt) if micro_batch["teacher_logprobs"] is not None else None
+                micro_batch["teacher_logprobs"].to("cuda") if micro_batch["teacher_logprobs"] is not None else None
             )
             routed_experts = (
-                micro_batch["routed_experts"].to(dt) if micro_batch["routed_experts"] is not None else None
+                micro_batch["routed_experts"].to("cuda") if micro_batch["routed_experts"] is not None else None
             )
 
             if routed_experts is None and config.enable_router_replay:
@@ -405,9 +394,9 @@ def train(config: TrainerConfig):
             # just {"pixel_values": ...} for Gemma3-VL) — we move every
             # tensor to CUDA and let the model's forward sort them.
             mm_kwargs_raw = micro_batch.get("mm_kwargs")
-            mm_kwargs = {k: v.to(dt) for k, v in mm_kwargs_raw.items()} if mm_kwargs_raw else None
+            mm_kwargs = {k: v.to("cuda") for k, v in mm_kwargs_raw.items()} if mm_kwargs_raw else None
             mm_token_type_ids = (
-                micro_batch["mm_token_type_ids"].to(dt)
+                micro_batch["mm_token_type_ids"].to("cuda")
                 if micro_batch.get("mm_token_type_ids") is not None
                 else None
             )
@@ -429,7 +418,7 @@ def train(config: TrainerConfig):
                 forward_position_ids = position_ids
 
             if config.model.lora:
-                lora_num_tokens = micro_batch["lora_num_tokens"].to(dt)
+                lora_num_tokens = micro_batch["lora_num_tokens"].to("cuda")
                 if cp_enabled:
                     chunk_size = input_ids.shape[1]
                     # Convert to cumsum, adjust for CP chunk, convert back to num_tokens
@@ -440,7 +429,7 @@ def train(config: TrainerConfig):
                     )
                 set_lora_num_tokens(lora_num_tokens)
 
-            temperatures = micro_batch["temperatures"].to(dt)
+            temperatures = micro_batch["temperatures"].to("cuda")
 
             # Shard temperatures for context parallelism if enabled
             if cp_enabled:
@@ -502,9 +491,7 @@ def train(config: TrainerConfig):
                 loss.backward()
 
             # Add relevant tensors to tensor dict for logging purposes
-            # NPU workaround: avoid boolean-mask indexing on device (triggers
-            # aclnnNonzeroV2 aicore exception). Move both tensors to CPU first.
-            entropy = out["entropy"].detach().to("cpu")[loss_mask.detach().to("cpu")]
+            entropy = out["entropy"][loss_mask].detach().to("cpu")
             tensors["entropy/all"].append(entropy)
             tensors["loss"].append(loss.detach().to("cpu").unsqueeze(0))
 
@@ -520,8 +507,7 @@ def train(config: TrainerConfig):
             if micro_batch["training_mode"] != "sft":
                 with torch.no_grad():
                     _, _, mismatch_kl = compute_importance_ratio_and_mismatch_kl(out["logprobs"], inference_logprobs)
-                # NPU workaround: avoid boolean-mask indexing on device
-                mismatch_kl = mismatch_kl.detach().to("cpu")[loss_mask.detach().to("cpu")]
+                mismatch_kl = mismatch_kl[loss_mask].detach().to("cpu")
                 tensors["mismatch_kl/all"].append(mismatch_kl)
                 for env_name, indices in env_to_indices.items():
                     tensors[f"mismatch_kl/{env_name}"].append(mismatch_kl[indices])
@@ -577,7 +563,7 @@ def train(config: TrainerConfig):
                 model.parameters(), max_norm=config.optim.max_norm, ep_enabled=parallel_dims.ep_enabled
             )
             if grad_norm.device.type == "cpu":
-                grad_norm = grad_norm.to(get_device())
+                grad_norm = grad_norm.to(torch.device("cuda"))
 
         zero_grad_ratio = get_zero_gradient_ratio(model.parameters(), parallel_dims.dp_replicate)
 
@@ -609,7 +595,7 @@ def train(config: TrainerConfig):
         perf_counter = get_perf_counter(model, seq_len)
         throughput = perf_counter.get_step_tokens_per_second(num_tokens, forward_backward_time)
         mfu = perf_counter.get_step_mfu(num_tokens, forward_backward_time)
-        peak_memory = max_memory_reserved() / 1024**3  # GiB
+        peak_memory = torch.cuda.max_memory_reserved() / 1024**3  # GiB
 
         # Log step metrics
         step_time = time.perf_counter() - step_start_time

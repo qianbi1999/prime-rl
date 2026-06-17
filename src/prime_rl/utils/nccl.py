@@ -1,23 +1,20 @@
 import os
 
+import pynvml
+
 from prime_rl.utils.logger import get_logger
 
 
 def disable_nccl_p2p_if_unavailable() -> None:
-    """Disable NCCL/HCCL P2P/SHM transports when devices lack direct interconnect.
+    """Disable NCCL P2P/SHM transports when GPUs lack NVLink interconnect.
 
-    In environments without NVLink or HCCS (e.g. PCIe-only or VMs with device
-    passthrough), P2P and SHM transports can fail because they rely on device IPC
-    which requires peer access. Disabling them forces use of socket-based transport.
+    In environments without NVLink (e.g. PCIe-only or VMs with GPU passthrough),
+    NCCL's P2P and SHM transports can fail because they rely on CUDA IPC which
+    requires peer access. Disabling them forces NCCL to use socket-based transport.
 
-    Uses pynvml to check physical GPU topology on CUDA, skips gracefully on NPU.
+    Uses pynvml to check physical GPU topology, which works regardless of
+    CUDA_VISIBLE_DEVICES restrictions on the current process.
     """
-    try:
-        import pynvml
-    except ImportError:
-        # Non-CUDA platform (e.g. Ascend NPU) — skip NVLink check
-        return
-
     pynvml.nvmlInit()
     try:
         n = pynvml.nvmlDeviceGetCount()

@@ -69,9 +69,7 @@ def count_zero_gradient_elements(parameters: Iterable[nn.Parameter]) -> tuple[Te
     metric instead of silently dropping them from the count.
     """
 
-    from prime_rl._device import get_device_string, current_device
-
-    device = torch.device(get_device_string(), current_device())
+    device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
     num_zeros = torch.zeros((), dtype=torch.long, device=device)
     num_tracked = torch.zeros((), dtype=torch.long, device=device)
 
@@ -133,15 +131,14 @@ def get_ckpt_disk_metrics(output_dir: Path) -> dict[str, float]:
 
 
 def setup_torch_distributed(timeout: timedelta = DEFAULT_TIMEOUT, enable_gloo: bool = False):
-    from prime_rl._device import get_dist_backend, set_device
-
     device_id = get_world().local_rank
-    set_device(device_id)
-    # Use Gloo backend for CPU and device-specific backend for accelerator when CPU offloading
-    # is enabled. Otherwise use the default backend for best performance.
-    backend = get_dist_backend(enable_gloo)
+    torch.cuda.set_device(device_id)
+    # Use Gloo backend for CPU and NCCL for GPU when CPU offloading is enabled
+    # Otherwise use NCCL for better GPU performance
+    backend = None  # by default nccl
     if enable_gloo:
-        get_logger().info(f"Using Gloo backend for CPU and {backend} backend for accelerator")
+        get_logger().info("Using Gloo backend for CPU and NCCL backend for GPU")
+        backend = "cpu:gloo,cuda:nccl"
 
     dist.init_process_group(backend=backend, timeout=timeout, device_id=device_id)
 
@@ -246,7 +243,7 @@ def print_benchmark(history: dict[str, list[Any]]) -> None:
             lambda row: f"{row['mean']} ± {row['std']} [{row['min']}, {row['max']}]", axis=1
         ).tolist()
         + [
-            f"{format_num(mean_df['Peak Memory']['mean'], precision=1)} GiB ({mean_df['Peak Memory']['mean'] / (mem_get_info()[1] / 1024**3) * 100:.1f}%)"
+            f"{format_num(mean_df['Peak Memory']['mean'], precision=1)} GiB ({mean_df['Peak Memory']['mean'] / (torch.cuda.mem_get_info()[1] / 1024**3) * 100:.1f}%)"
         ]
     )
     table.add_row(*mean_row)
@@ -279,9 +276,7 @@ def export_benchmark_json(history: dict[str, list[Any]], output_path: Path) -> N
     stats = df.describe().loc[["mean", "std", "min", "max"], :]
 
     # Get peak memory percentage
-    from prime_rl._device import mem_get_info
-
-    total_memory_gib = mem_get_info()[1] / 1024**3
+    total_memory_gib = torch.cuda.mem_get_info()[1] / 1024**3
     peak_memory_pct = stats["peak_memory"]["mean"] / total_memory_gib * 100
 
     result = {
@@ -365,11 +360,8 @@ class Tensors(defaultdict):
         metrics = {}
         for key in keys:
             # All-gather tensors across steps and ranks (get global distribution)
-            from prime_rl._device import get_device_string
-
             values = self.pop(key, [])
-            dt = get_device_string()
-            tensors = torch.cat(values, dim=0).to(dt) if values else torch.empty(0, device=dt)
+            tensors = torch.cat(values, dim=0).to("cuda") if values else torch.empty(0, device="cuda")
             assert tensors.ndim == 1, "Can only aggregate 1D tensors"
             tensors = flexible_all_gather(tensors)
             assert tensors.ndim == 1, "Can only aggregate 1D tensors"
@@ -438,24 +430,20 @@ MEMORY_SNAPSHOT_MAX_ENTRIES = 100000
 
 class MemoryProfiler:
     def __init__(self, step_num: int, snapshot_path: Path):
-        from prime_rl._device import record_memory_history
-
-        record_memory_history(max_entries=MEMORY_SNAPSHOT_MAX_ENTRIES)
+        torch.cuda.memory._record_memory_history(max_entries=MEMORY_SNAPSHOT_MAX_ENTRIES)
         self.logger = get_logger()
         snapshot_path.mkdir(parents=True, exist_ok=True)
         self.snapshot_path = snapshot_path
         self.step_num = step_num
 
     def step(self):
-        from prime_rl._device import memory_snapshot
-
         self.logger.info(f"Dumping memory snapshot at step {self.step_num} at {self.snapshot_path}")
         begin = time.monotonic()
         step_folder = self.snapshot_path / f"step_{self.step_num}"
         step_folder.mkdir(parents=True, exist_ok=True)
         file_path = step_folder / f"rank_{get_world().rank}.pickle"
         with open(file_path, "wb") as output:
-            pickle.dump(memory_snapshot(), output)
+            pickle.dump(torch.cuda.memory._snapshot(), output)
         self.logger.info(
             f"Finished dumping memory snapshot in {time.monotonic() - begin:.2f} seconds, load {file_path} at https://docs.pytorch.org/memory_viz to visualize the memory usage"
         )

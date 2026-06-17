@@ -1,235 +1,3 @@
-diff --git a/examples/wordle/rl_npu.toml b/examples/wordle/rl_npu.toml
-new file mode 100644
-index 000000000..f2c14810c
---- /dev/null
-+++ b/examples/wordle/rl_npu.toml
-@@ -0,0 +1,60 @@
-+# Wordle RL on Ascend NPU (2-card minimal setup)
-+# Usage: uv run rl @ examples/wordle/rl_npu.toml
-+#
-+# Override model path if needed:
-+#   uv run rl @ examples/wordle/rl_npu.toml --model.name /path/to/model
-+#
-+# Override NPU devices:
-+#   ASCEND_RT_VISIBLE_DEVICES=14,15 uv run rl @ examples/wordle/rl_npu.toml
-+
-+max_steps = 200
-+seq_len = 8192
-+
-+[deployment]
-+type = "single_node"
-+gpus_per_node = 2
-+num_train_gpus = 1
-+num_infer_gpus = 1
-+
-+[wandb]
-+project = "wordle-npu"
-+name = "wordle-npu"
-+
-+[ckpt]
-+
-+[model]
-+name = "/data/z00949579/rl_course/model/Qwen3-1.7B"
-+
-+# Filesystem weight broadcast avoids NCCL entirely — required for NPU
-+[weight_broadcast]
-+type = "filesystem"
-+
-+[orchestrator]
-+batch_size = 32
-+group_size = 16
-+
-+[[orchestrator.train.env]]
-+id = "primeintellect/wordle"
-+name = "wordle"
-+
-+[orchestrator.train.sampling]
-+max_completion_tokens = 1024
-+
-+# Trainer: NPU-safe settings
-+[trainer]
-+matmul_precision = "highest"  # Required on non-CUDA devices (like ROCm)
-+
-+[trainer.model]
-+attn = "eager"                # No flash-attn on NPU
-+optimization_dtype = "float32"
-+reduce_dtype = "float32"
-+impl = "hf"                   # Use HuggingFace implementation
-+
-+# Inference: single NPU, no data parallelism
-+[inference.parallel]
-+dp = 1
-+tp = 1
-+
-+[orchestrator.renderer]
-+name = "qwen3"
-+preserve_all_thinking = true
-diff --git a/src/prime_rl/_device.py b/src/prime_rl/_device.py
-new file mode 100644
-index 000000000..aed7cd7d2
---- /dev/null
-+++ b/src/prime_rl/_device.py
-@@ -0,0 +1,160 @@
-+"""Device abstraction layer for NPU (Ascend) / CUDA portability.
-+
-+Import this module instead of hardcoding ``"cuda"`` or ``torch.cuda.*`` calls.
-+On Ascend NPUs the module redirects to ``torch.npu`` and ``hccl``; on CUDA GPUs
-+it stays on the original path.
-+
-+Usage::
-+
-+    from prime_rl._device import device_type, device_module, get_device, get_device_string
-+
-+    # String for torch.device() and .to(...) calls:
-+    x = tensor.to(get_device_string())
-+
-+    # torch.device object:
-+    dev = get_device(local_rank)
-+
-+    # For torch.X.set_device:
-+    device_module.set_device(local_rank)
-+
-+    # Backend string for dist.init_process_group:
-+    backend = get_dist_backend(enable_gloo=False)
-+"""
-+
-+from __future__ import annotations
-+
-+import torch
-+
-+# -- Detection -----------------------------------------------------------
-+_HAS_NPU = hasattr(torch, "npu") and torch.npu.is_available()
-+_HAS_CUDA = torch.cuda.is_available()
-+
-+if _HAS_NPU:
-+    device_type: str = "npu"
-+    device_module = torch.npu
-+    _DIST_BACKEND = "hccl"
-+elif _HAS_CUDA:
-+    device_type = "cuda"
-+    device_module = torch.cuda
-+    _DIST_BACKEND = "nccl"
-+else:
-+    # Fallback: assume NPU if torch_npu is imported (even if not detected)
-+    device_type = "npu"
-+    device_module = getattr(torch, "npu", torch.cuda)
-+    _DIST_BACKEND = "hccl" if hasattr(torch, "npu") else "nccl"
-+
-+
-+def get_device_string() -> str:
-+    """Return the device type string (``"npu"`` or ``"cuda"``)."""
-+    return device_type
-+
-+
-+def get_device(local_rank: int = -1) -> torch.device:
-+    """Return a ``torch.device`` for the detected accelerator.
-+
-+    When ``local_rank >= 0``, the index targets a specific device (e.g. for
-+    ``torch.device("npu", 0)``).  When ``-1``, returns the generic device
-+    (``torch.device("npu")``).
-+    """
-+    if local_rank >= 0:
-+        return torch.device(device_type, local_rank)
-+    return torch.device(device_type)
-+
-+
-+def get_dist_backend(enable_gloo: bool = False) -> str | None:
-+    """Return the distributed backend string for ``init_process_group``.
-+
-+    When ``enable_gloo=True``, returns ``"cpu:gloo,{device}:{comm_backend}"``
-+    for CPU offloading scenarios. Otherwise returns ``None`` (the default,
-+    which is HCCL on NPU / NCCL on CUDA).
-+    """
-+    if enable_gloo:
-+        return f"cpu:gloo,{device_type}:{_DIST_BACKEND}"
-+    return None  # default backend
-+
-+
-+def get_visible_devices_env() -> str:
-+    """Environment variable name for visible device selection."""
-+    return "ASCEND_RT_VISIBLE_DEVICES" if device_type == "npu" else "CUDA_VISIBLE_DEVICES"
-+
-+
-+def get_alloc_conf_env() -> str:
-+    """Environment variable name for PyTorch memory allocator configuration."""
-+    return "PYTORCH_NPU_ALLOC_CONF" if device_type == "npu" else "PYTORCH_CUDA_ALLOC_CONF"
-+
-+
-+def get_profiler_activity():
-+    """Return the device-appropriate ``ProfilerActivity`` enum value."""
-+    if device_type == "npu":
-+        # Ascend NPU uses its own profiler activity
-+        try:
-+            from torch_npu.profiler import ProfilerActivity as NpuProfilerActivity
-+            return NpuProfilerActivity.NPU
-+        except ImportError:
-+            return None  # profiling not supported
-+    return torch.profiler.ProfilerActivity.CUDA
-+
-+
-+def get_peak_flops() -> float:
-+    """Return peak BF16 FLOPS for the detected device."""
-+    if device_type == "npu":
-+        name = device_module.get_device_name(0) if device_module.device_count() > 0 else ""
-+        if "910" in name:
-+            # Ascend 910B/C: ~320 TFLOPS BF16 (matrix)
-+            return 320e12
-+        return 312e12  # fallback
-+    # CUDA path — delegated to PerfCounter._get_peak_flops
-+    return 0.0  # caller should use PerfCounter's logic
-+
-+
-+def reset_peak_memory_stats() -> None:
-+    """Reset peak memory statistics."""
-+    device_module.reset_peak_memory_stats()
-+
-+
-+def max_memory_reserved() -> float:
-+    """Return max reserved memory in bytes."""
-+    return device_module.max_memory_reserved()
-+
-+
-+def mem_get_info(device_index: int | None = None):
-+    """Return (free_bytes, total_bytes) tuple for the device."""
-+    return device_module.mem_get_info(device_index)
-+
-+
-+def set_device(device_index: int) -> None:
-+    """Set the current device."""
-+    device_module.set_device(device_index)
-+
-+
-+def current_device() -> int:
-+    """Return the current device index."""
-+    return device_module.current_device()
-+
-+
-+def device_count() -> int:
-+    """Return the number of available devices."""
-+    return device_module.device_count()
-+
-+
-+def synchronize() -> None:
-+    """Synchronize the device."""
-+    device_module.synchronize()
-+
-+
-+def empty_cache() -> None:
-+    """Empty the device memory cache."""
-+    device_module.empty_cache()
-+
-+
-+def record_memory_history(max_entries: int = 100000) -> None:
-+    """Start recording memory allocation history."""
-+    if hasattr(device_module, "memory") and hasattr(device_module.memory, "_record_memory_history"):
-+        device_module.memory._record_memory_history(max_entries=max_entries)
-+
-+
-+def memory_snapshot():
-+    """Take a memory snapshot. Returns a dict suitable for pickle."""
-+    if hasattr(device_module, "memory") and hasattr(device_module.memory, "_snapshot"):
-+        return device_module.memory._snapshot()
-+    return {}
 diff --git a/src/prime_rl/entrypoints/rl.py b/src/prime_rl/entrypoints/rl.py
 index 0ccdd7c53..400fbe1d5 100644
 --- a/src/prime_rl/entrypoints/rl.py
@@ -423,10 +191,18 @@ index 2c349d4de..133c5b255 100644
              torch.distributed.barrier()
              if isinstance(model, PreTrainedModelPrimeRL):
 diff --git a/src/prime_rl/trainer/optim.py b/src/prime_rl/trainer/optim.py
-index d8465cc38..352fd4060 100644
+index d8465cc38..569ef4fa9 100644
 --- a/src/prime_rl/trainer/optim.py
 +++ b/src/prime_rl/trainer/optim.py
-@@ -64,8 +64,10 @@ class CPUOffloadOptimizer:
+@@ -3,7 +3,6 @@ import time
+ from typing import Callable
+ 
+ import torch
+-from dion import Muon
+ from torch import nn
+ from torch.distributed.tensor import DTensor
+ from torch.optim import SGD, AdamW, Optimizer
+@@ -64,8 +63,10 @@ class CPUOffloadOptimizer:
              self._initialized = True
              return result
  
@@ -439,7 +215,7 @@ index d8465cc38..352fd4060 100644
  
          # Run optimizer step
          result = self.optimizer.step(closure)
-@@ -79,10 +81,12 @@ class CPUOffloadOptimizer:
+@@ -79,10 +80,12 @@ class CPUOffloadOptimizer:
          self.optimizer.zero_grad(set_to_none=set_to_none)
  
      def state_dict(self):
@@ -455,6 +231,15 @@ index d8465cc38..352fd4060 100644
          sd = self.optimizer.state_dict()
          if self._initialized:
              self._move_states("cpu")
+@@ -244,6 +247,8 @@ def _create_muon_optimizer(
+     else:
+         distributed_mesh = parallel_dims.world_mesh
+ 
++    from dion import Muon  # noqa: F811
++
+     optimizer = Muon(
+         params=param_groups,
+         lr=lr,
 diff --git a/src/prime_rl/trainer/parallel_dims.py b/src/prime_rl/trainer/parallel_dims.py
 index dbfe85572..8b65cc0df 100644
 --- a/src/prime_rl/trainer/parallel_dims.py
@@ -525,7 +310,7 @@ index e419bda2f..86ed4c294 100644
          return FileSystemWeightBroadcast(output_dir, config, lora_config)
      else:
 diff --git a/src/prime_rl/trainer/rl/train.py b/src/prime_rl/trainer/rl/train.py
-index fbdfa99b3..90ccaaa06 100644
+index fbdfa99b3..f575e8568 100644
 --- a/src/prime_rl/trainer/rl/train.py
 +++ b/src/prime_rl/trainer/rl/train.py
 @@ -7,6 +7,13 @@ from datetime import timedelta
@@ -542,7 +327,15 @@ index fbdfa99b3..90ccaaa06 100644
  from prime_rl.trainer.models.layers.attn import substitute_ring_attn
  from prime_rl.trainer.rl.broadcast import setup_weight_broadcast
  from prime_rl.utils.act_offloading import maybe_activation_offloading
-@@ -118,7 +125,7 @@ def train(config: TrainerConfig):
+@@ -66,7 +73,6 @@ from prime_rl.utils.monitor import setup_monitor
+ from prime_rl.utils.config import cli
+ from prime_rl.utils.process import set_proc_title
+ from prime_rl.utils.utils import clean_exit, resolve_latest_ckpt_step, to_col_format
+-from ring_flash_attn import substitute_hf_flash_attn
+ from torchtitan.distributed.utils import clip_grad_norm_
+ 
+ 
+@@ -118,7 +124,7 @@ def train(config: TrainerConfig):
  
      # Setup multi run manager and offsets (including LoRA validation/scaling hooks if applicable)
      multi_run_manager = setup_multi_run_manager(
@@ -551,7 +344,16 @@ index fbdfa99b3..90ccaaa06 100644
      )
  
      # Initialize parallel dimensions
-@@ -249,11 +256,13 @@ def train(config: TrainerConfig):
+@@ -189,6 +195,8 @@ def train(config: TrainerConfig):
+         cp_group = parallel_dims.world_mesh["cp"].get_group()
+         cp_rank = parallel_dims.world_mesh["cp"].get_local_rank()
+         if config.model.cp_style == "ring":
++            from ring_flash_attn import substitute_hf_flash_attn  # noqa: F811
++
+             substitute_hf_flash_attn(cp_group, heads_k_stride=1)
+             substitute_ring_attn(cp_group, heads_k_stride=1, attn_impl=config.model.attn)
+         else:
+@@ -249,11 +257,13 @@ def train(config: TrainerConfig):
      maybe_record_function = nullcontext
      if config.trace_path:
          logger.info(f"Tracing to {config.trace_path}")
@@ -567,7 +369,7 @@ index fbdfa99b3..90ccaaa06 100644
          if gc_handler is not None:
              gc_handler.run(progress.step)
          is_last_step = config.max_steps is not None and progress.step == config.max_steps
-@@ -354,8 +363,9 @@ def train(config: TrainerConfig):
+@@ -354,8 +364,9 @@ def train(config: TrainerConfig):
          # divides by the same denominator. With a per-rank denominator, ranks with fewer loss
          # tokens implicitly upweight their per-token gradient contribution after FSDP averaging.
          # FSDP's per-rank divide is undone after the microbatch loop via fsdp_gradient_divide_factor.
@@ -578,7 +380,7 @@ index fbdfa99b3..90ccaaa06 100644
          dp_cp_group = parallel_dims.get_mesh("dp_cp").get_group()
          dist.all_reduce(global_loss_scale, op=dist.ReduceOp.SUM, group=dp_cp_group)
          loss_scale = max(global_loss_scale.item(), 1)
-@@ -368,16 +378,16 @@ def train(config: TrainerConfig):
+@@ -368,16 +379,16 @@ def train(config: TrainerConfig):
          cp_size = parallel_dims.cp
  
          for micro_step, micro_batch in enumerate(micro_batches):
@@ -602,7 +404,7 @@ index fbdfa99b3..90ccaaa06 100644
              )
  
              if routed_experts is None and config.enable_router_replay:
-@@ -394,9 +404,9 @@ def train(config: TrainerConfig):
+@@ -394,9 +405,9 @@ def train(config: TrainerConfig):
              # just {"pixel_values": ...} for Gemma3-VL) — we move every
              # tensor to CUDA and let the model's forward sort them.
              mm_kwargs_raw = micro_batch.get("mm_kwargs")
@@ -614,7 +416,7 @@ index fbdfa99b3..90ccaaa06 100644
                  if micro_batch.get("mm_token_type_ids") is not None
                  else None
              )
-@@ -418,7 +428,7 @@ def train(config: TrainerConfig):
+@@ -418,7 +429,7 @@ def train(config: TrainerConfig):
                  forward_position_ids = position_ids
  
              if config.model.lora:
@@ -623,7 +425,7 @@ index fbdfa99b3..90ccaaa06 100644
                  if cp_enabled:
                      chunk_size = input_ids.shape[1]
                      # Convert to cumsum, adjust for CP chunk, convert back to num_tokens
-@@ -429,7 +439,7 @@ def train(config: TrainerConfig):
+@@ -429,7 +440,7 @@ def train(config: TrainerConfig):
                      )
                  set_lora_num_tokens(lora_num_tokens)
  
@@ -632,7 +434,28 @@ index fbdfa99b3..90ccaaa06 100644
  
              # Shard temperatures for context parallelism if enabled
              if cp_enabled:
-@@ -563,7 +573,7 @@ def train(config: TrainerConfig):
+@@ -491,7 +502,9 @@ def train(config: TrainerConfig):
+                 loss.backward()
+ 
+             # Add relevant tensors to tensor dict for logging purposes
+-            entropy = out["entropy"][loss_mask].detach().to("cpu")
++            # NPU workaround: avoid boolean-mask indexing on device (triggers
++            # aclnnNonzeroV2 aicore exception). Move both tensors to CPU first.
++            entropy = out["entropy"].detach().to("cpu")[loss_mask.detach().to("cpu")]
+             tensors["entropy/all"].append(entropy)
+             tensors["loss"].append(loss.detach().to("cpu").unsqueeze(0))
+ 
+@@ -507,7 +520,8 @@ def train(config: TrainerConfig):
+             if micro_batch["training_mode"] != "sft":
+                 with torch.no_grad():
+                     _, _, mismatch_kl = compute_importance_ratio_and_mismatch_kl(out["logprobs"], inference_logprobs)
+-                mismatch_kl = mismatch_kl[loss_mask].detach().to("cpu")
++                # NPU workaround: avoid boolean-mask indexing on device
++                mismatch_kl = mismatch_kl.detach().to("cpu")[loss_mask.detach().to("cpu")]
+                 tensors["mismatch_kl/all"].append(mismatch_kl)
+                 for env_name, indices in env_to_indices.items():
+                     tensors[f"mismatch_kl/{env_name}"].append(mismatch_kl[indices])
+@@ -563,7 +577,7 @@ def train(config: TrainerConfig):
                  model.parameters(), max_norm=config.optim.max_norm, ep_enabled=parallel_dims.ep_enabled
              )
              if grad_norm.device.type == "cpu":
@@ -641,7 +464,7 @@ index fbdfa99b3..90ccaaa06 100644
  
          zero_grad_ratio = get_zero_gradient_ratio(model.parameters(), parallel_dims.dp_replicate)
  
-@@ -595,7 +605,7 @@ def train(config: TrainerConfig):
+@@ -595,7 +609,7 @@ def train(config: TrainerConfig):
          perf_counter = get_perf_counter(model, seq_len)
          throughput = perf_counter.get_step_tokens_per_second(num_tokens, forward_backward_time)
          mfu = perf_counter.get_step_mfu(num_tokens, forward_backward_time)
@@ -747,6 +570,27 @@ index 9a8a86a52..95b1be697 100644
          self.logger.info(
              f"Finished dumping memory snapshot in {time.monotonic() - begin:.2f} seconds, load {file_path} at https://docs.pytorch.org/memory_viz to visualize the memory usage"
          )
+diff --git a/src/prime_rl/utils/cp.py b/src/prime_rl/utils/cp.py
+index 2ac9d45ad..c501c12fe 100644
+--- a/src/prime_rl/utils/cp.py
++++ b/src/prime_rl/utils/cp.py
+@@ -9,7 +9,6 @@ import torch
+ import torch.distributed as dist
+ import torch.distributed.nn as dist_nn
+ import torch.nn as nn
+-from ring_flash_attn import update_ring_flash_attn_params
+ 
+ from prime_rl.utils.sequence import get_cu_seqlens_from_position_ids
+ 
+@@ -205,6 +204,8 @@ def setup_cp_params(
+     cu_seqlens, max_seqlen = get_cu_seqlens_from_position_ids(position_ids)
+ 
+     if cp_style == "ring":
++        from ring_flash_attn import update_ring_flash_attn_params  # noqa: F811
++
+         update_ring_flash_attn_params(cu_seqlens, cp_group)
+     elif cp_style == "ulysses":
+         # Delayed import: ulysses_attn lives under trainer.models, which imports
 diff --git a/src/prime_rl/utils/nccl.py b/src/prime_rl/utils/nccl.py
 index bb581ceeb..15d87f4a8 100644
 --- a/src/prime_rl/utils/nccl.py

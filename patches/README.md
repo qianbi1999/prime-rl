@@ -1,97 +1,178 @@
-# NPU (Ascend) Migration Patches
+# Ascend NPU RL Training Guide
 
-Patches to run prime-rl RL training on Ascend NPU (910B/C).
+在 Ascend NPU (910B/C) 上跑通 prime-rl Wordle RL 训练的完整指南。
 
-## Environment
+## 基础环境
 
-| Component | Version / Path |
-|-----------|---------------|
-| NPU | Ascend 910C × 16 |
+| 项目 | 版本/路径 |
+|------|----------|
+| 基础镜像 | `quay.io/ascend/vllm-ascend:v0.20.2rc1-a3` |
 | CANN | 9.0.0 |
 | torch | 2.10.0 + torch_npu 2.10.0 |
 | vllm | 0.20.2 + vllm_ascend 0.20.2rc1 |
-| transformers | 5.5.3 |
-| Model | `/data/z00949579/rl_course/model/Qwen3-1.7B` |
+| transformers | 5.5.3+ |
+| Python | 3.11+ |
 
-## Patch Files
+## 快速开始
 
-| Patch | Scope | Description |
-|-------|-------|-------------|
-| `0001-npu-migration.patch` | All files (combined) | Full migration diff — apply this to reproduce all changes |
-| `0002-device-abstraction.patch` | `src/prime_rl/_device.py` (new) | Device abstraction layer — auto-detects NPU/CUDA |
-| `0003-npu-wordle-config.patch` | `examples/wordle/rl_npu.toml` (new) | NPU-specific Wordle RL config |
-
-## What Was Changed
-
-### 1. New: `src/prime_rl/_device.py` — Device Abstraction Layer
-
-Central module that auto-detects the accelerator type and provides device-agnostic helpers:
-
-- `get_device_string()` → `"npu"` / `"cuda"`
-- `get_device(local_rank)` → `torch.device(...)`
-- `get_dist_backend(enable_gloo)` → `"hccl"` / `"nccl"`
-- Memory APIs: `reset_peak_memory_stats()`, `max_memory_reserved()`, `mem_get_info()`, etc.
-- `get_visible_devices_env()` → `ASCEND_RT_VISIBLE_DEVICES` / `CUDA_VISIBLE_DEVICES`
-- `get_alloc_conf_env()` → `PYTORCH_NPU_ALLOC_CONF` / `PYTORCH_CUDA_ALLOC_CONF`
-
-### 2. Launcher (`entrypoints/rl.py`)
-
-- `pynvml` → removed; uses `torch.npu.device_count()` instead
-- `CUDA_VISIBLE_DEVICES` → `ASCEND_RT_VISIBLE_DEVICES` (dynamic)
-- `PYTORCH_CUDA_ALLOC_CONF` → `PYTORCH_NPU_ALLOC_CONF` (dynamic)
-
-### 3. Distributed / Device Setup
-
-| File | Change |
-|------|--------|
-| `parallel_dims.py` | `device_type` from `_device.py` instead of `_get_available_device_type()` |
-| `utils.py` | `setup_torch_distributed` uses `hccl` backend; all `torch.cuda.*` → `_device` helpers |
-| `utils/utils.py` | `get_cuda_visible_devices` → reads dynamic env var |
-| `utils/nccl.py` | `pynvml` import guarded with `try/except ImportError` |
-
-### 4. Trainer Core
-
-| File | Change |
-|------|--------|
-| `trainer/rl/train.py` | All `.to("cuda")` → `.to(dt)`; `ProfilerActivity.CUDA` → dynamic; `torch.cuda.*` → `_device` helpers |
-| `trainer/model.py` | Device strings → `get_device_string()`; `torch.cuda.get_device_capability()` guarded; `_move_buffers_to_cuda` uses dynamic device |
-| `trainer/perf.py` | Ascend 910 FLOPS (~320 TFLOPS BF16) added to peak FLOPS table |
-| `trainer/ckpt.py` | `opt._move_states("cuda")` → `opt._move_states(get_device_string())` |
-| `trainer/optim.py` | Same `_move_states` fix |
-| `trainer/rl/broadcast/__init__.py` | `torch.cuda.current_device()` → `current_device()` from `_device` |
-
-### 5. New Config: `examples/wordle/rl_npu.toml`
-
-Minimal 2-card NPU config with safe defaults:
-
-- `matmul_precision = "highest"` — required for non-CUDA devices (like ROCm)
-- `attn = "eager"` — flash-attention not available on NPU
-- `optimization_dtype / reduce_dtype = "float32"` — safe starting point
-- `impl = "hf"` — HuggingFace model path (avoids custom PrimeRL kernels)
-- `weight_broadcast.type = "filesystem"` — avoids NCCL entirely
-- 1 trainer NPU + 1 inference NPU
-
-## Usage
+### 1. 应用 NPU 适配 patch
 
 ```bash
-# 1. Apply the combined patch (if starting from clean repo)
-git apply patches/0001-npu-migration.patch
-
-# 2. Start vLLM inference server on NPU 15
-ASCEND_RT_VISIBLE_DEVICES=15 uv run inference \
-  --model.name /data/z00949579/rl_course/model/Qwen3-1.7B \
-  --model.impl hf \
-  --dtype float32
-
-# 3. Start RL training on NPU 14
-ASCEND_RT_VISIBLE_DEVICES=14 uv run rl @ examples/wordle/rl_npu.toml
+cd prime-rl
+bash patches/apply.sh
 ```
 
-## Known Limitations
+三层 patch：
+- `0001-device-abstraction.patch` — 设备抽象层 (`_device.py`)，自动检测 NPU/CUDA
+- `0002-source-adaptation.patch` — 11 个源文件的 CUDA→NPU 替换
+- `0003-npu-config.patch` — Wordle RL NPU 训练配置 (`rl_npu.toml`)
 
-- **flash-attn / ring-flash-attn**: Not available → `attn = "eager"` only
-- **liger-kernel**: Not available → skipped (Qwen3-1.7B doesn't depend on it)
-- **NCCL weight broadcast**: Not supported → `filesystem` mode used instead
-- **Context Parallel (CP)**: Not supported (requires ring-flash-attn)
-- **FP8 training**: Not supported (requires Hopper SM90+)
-- **Memory profiler snapshots**: May not be compatible with PyTorch memory_viz
+### 2. 安装依赖
+
+```bash
+# 基础依赖
+pip install -r requirements-npu.txt
+
+# prime-rl 本地包
+pip install -e packages/prime-rl-configs
+pip install -e . --no-deps
+
+# torchtitan
+pip install git+https://github.com/pytorch/torchtitan@a1fdd7e
+
+# wordle 环境（从 git submodule）
+git config submodule.verifiers.url https://github.com/PrimeIntellect-ai/verifiers.git
+git submodule update --init deps/verifiers
+pip install -e deps/verifiers --no-deps
+pip install -e deps/verifiers/environments/wordle
+```
+
+### 3. NLTK 数据
+
+```bash
+python3 -c "import nltk; nltk.download('averaged_perceptron_tagger_eng')"
+```
+
+### 4. 准备模型权重
+
+将 HuggingFace 格式的 Qwen3-1.7B 权重（SFT 后）放到本地路径，例如：
+`/data/model/checkpoint_wordle_sft/step-20/`
+
+### 5. 配置
+
+编辑 `examples/wordle/rl_npu.toml`：
+```toml
+[model]
+name = "/data/model/checkpoint_wordle_sft/step-20"  # 你的模型路径
+```
+
+### 6. 启动训练
+
+```bash
+# 先查卡
+npu-smi info
+
+# 两张空闲卡，例如 phy-id 4,5
+ASCEND_RT_VISIBLE_DEVICES=4,5 WANDB_MODE=offline \
+  python3 -m prime_rl.entrypoints.rl @ examples/wordle/rl_npu.toml
+```
+
+### 7. 查看日志
+
+```bash
+tail -f outputs/logs/orchestrator.log   # reward, turns, error 率
+tail -f outputs/logs/trainer.log        # loss, entropy, grad norm, 吞吐
+tail -f outputs/logs/inference.log      # vLLM 引擎状态
+```
+
+## 配置说明
+
+| 参数 | 值 | 为什么 |
+|------|-----|--------|
+| `seq_len = 1024` | Wordle 6 轮 × 150 token ≈ 900，1024 刚好 | 防 OOM |
+| `optimization_dtype = float32` | NPU bf16 下 softmax 溢出 NaN | 精度换稳定性 |
+| `attn = eager` | flash-attn 在 NPU 上不可用 | 小模型影响不大 |
+| `matmul_precision = highest` | NPU/ROCm 需要完整 FP32 matmul | 防 softmax 精度崩 |
+| `gpu_memory_utilization = 0.80` | 默认 0.90 太激进 | 留空间给碎片 |
+| `weight_broadcast.type = filesystem` | HCCL 不完全兼容 | 走文件最稳 |
+| `batch_size = 8, group_size = 4` | float32 下内存受限 | 小 batch 噪声大 |
+| `lr = 1e-7` | 1e-6 导致权重爆炸 | RL 对 lr 比 SFT 敏感 |
+
+## 常见问题
+
+### NaN logprob / "Out of range float values"
+
+vLLM 返回 400，orchestrator 日志 Error 率飙升。
+
+**根因**：bf16 下 log_softmax 溢出（词表 152064 太大），logprob=NaN，JSON 不可序列化。
+
+**修复**：切 `optimization_dtype = float32`。
+
+### Rollout inflight 挂起
+
+16 inflight 始终不 buffered，推理请求不完成。
+
+**排查**：
+```bash
+curl -s http://localhost:8000/v1/models  # 如果挂起 → vLLM 死锁
+grep "200 OK" outputs/logs/inference.log  # 检查是否有成功请求
+```
+
+**修复**：换一张 NPU 卡，或重启训练。
+
+### Grad Norm 爆炸
+
+Grad Norm 从 1 飙到 4 亿。
+
+**根因**：小 batch 下一条异常 rollout 导致梯度尖峰。
+
+**修复**：加大 `batch_size` 或降低 `lr`。
+
+### acl 硬件异常
+
+`aclnnNonzeroV2 (507015)` / `vector core exception (507035)`。
+
+**507015**：NPU boolean mask 索引 bug，patch 已含 workaround（先移到 CPU 再做 mask）。
+
+**507035**：硬件层异常，换 NPU 卡或重启。
+
+### 僵尸进程清理
+
+```bash
+# 查看
+ps aux | grep "PRIME-RL\|VLLM::EngineCore"
+
+# 清理
+kill -9 $(ps aux | grep -E "PRIME-RL|VLLM::EngineCore" | grep -v grep | awk '{print $2}')
+```
+
+### NPU 卡被占
+
+```bash
+npu-smi info | grep -A40 "Process"
+```
+
+如果目标卡有别人的进程，换空闲卡：
+```bash
+ASCEND_RT_VISIBLE_DEVICES=<free-ids> ...
+```
+
+## 已知限制
+
+- **flash-attn / ring-flash-attn / liger-kernel**：NPU 不支持，attn 必须 eager
+- **NCCL weight broadcast**：走 filesystem，不支持 NCCL
+- **Context Parallel (CP)**：不可用（依赖 ring-flash-attn）
+- **FP8 训练**：不支持（需要 Hopper SM90+）
+- **bf16 训练**：大词表模型不稳定，建议 float32
+
+## 性能参考
+
+Qwen3-1.7B Wordle RL, 2×Ascend 910C, float32, seq_len=1024, batch=8:
+
+| 指标 | 值 |
+|------|-----|
+| 训练吞吐 | ~2000 tokens/s |
+| MFU | ~7% |
+| 峰值内存 | ~37 GiB |
+| 每步耗时 | ~2s（编译后） |
+| Reward | 0.3-0.8（29步，SFT 初始化） |

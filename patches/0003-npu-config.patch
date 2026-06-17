@@ -1,9 +1,9 @@
 diff --git a/examples/wordle/rl_npu.toml b/examples/wordle/rl_npu.toml
 new file mode 100644
-index 000000000..f2c14810c
+index 000000000..3a2901912
 --- /dev/null
 +++ b/examples/wordle/rl_npu.toml
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,69 @@
 +# Wordle RL on Ascend NPU (2-card minimal setup)
 +# Usage: uv run rl @ examples/wordle/rl_npu.toml
 +#
@@ -14,7 +14,7 @@ index 000000000..f2c14810c
 +#   ASCEND_RT_VISIBLE_DEVICES=14,15 uv run rl @ examples/wordle/rl_npu.toml
 +
 +max_steps = 200
-+seq_len = 8192
++seq_len = 1024
 +
 +[deployment]
 +type = "single_node"
@@ -29,18 +29,18 @@ index 000000000..f2c14810c
 +[ckpt]
 +
 +[model]
-+name = "/data/z00949579/rl_course/model/Qwen3-1.7B"
++name = "/data/z00949579/rl_course/model/checkpoint_wordle_sft/step-20"
 +
 +# Filesystem weight broadcast avoids NCCL entirely — required for NPU
 +[weight_broadcast]
 +type = "filesystem"
 +
 +[orchestrator]
-+batch_size = 32
-+group_size = 16
++batch_size = 8
++group_size = 4
 +
 +[[orchestrator.train.env]]
-+id = "primeintellect/wordle"
++id = "wordle"
 +name = "wordle"
 +
 +[orchestrator.train.sampling]
@@ -50,6 +50,9 @@ index 000000000..f2c14810c
 +[trainer]
 +matmul_precision = "highest"  # Required on non-CUDA devices (like ROCm)
 +
++[trainer.optim]
++lr = 1e-7
++
 +[trainer.model]
 +attn = "eager"                # No flash-attn on NPU
 +optimization_dtype = "float32"
@@ -57,9 +60,15 @@ index 000000000..f2c14810c
 +impl = "hf"                   # Use HuggingFace implementation
 +
 +# Inference: single NPU, no data parallelism
++[inference]
++gpu_memory_utilization = 0.80
++
 +[inference.parallel]
 +dp = 1
 +tp = 1
++
++[orchestrator.student.client]
++skip_model_check = true
 +
 +[orchestrator.renderer]
 +name = "qwen3"

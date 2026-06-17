@@ -9,7 +9,7 @@ echo "  + src/prime_rl/_device.py"
 
 echo "=== Layer 2/3: Source code adaptation ==="
 git apply patches/0002-source-adaptation.patch
-echo "  ~ 11 source files (cuda → npu)"
+echo "  ~ 12 source files + pyproject.toml (cuda -> npu)"
 
 echo "=== Layer 3/3: NPU training config ==="
 git apply patches/0003-npu-config.patch
